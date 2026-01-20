@@ -47,7 +47,7 @@ where
     /// Returns `true` if the `Data` is empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.ptr.len() == 0
+        self.len() == 0
     }
 
     /// Constructs an empty `Data`.
@@ -60,6 +60,10 @@ where
     }
 
     pub fn from_data(data: &[D]) -> Self {
+        if data.is_empty() {
+            return Self::empty();
+        }
+
         let byte_len = size_of_val(data);
         let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
@@ -101,6 +105,34 @@ where
     /// Returns `true` if the two `Data` point to the same data.
     pub fn data_eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.ptr, &other.ptr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Row {
+        a: i64,
+    }
+
+    unsafe impl POD for Row {}
+
+    #[test]
+    fn data_from_empty_slice_does_not_panic() {
+        let data = Data::<Row>::from_data(&[]);
+        assert!(data.is_empty());
+        assert_eq!(data.len(), 0);
+    }
+
+    #[test]
+    fn data_is_empty_uses_logical_len() {
+        let ptr = DataPtr::new(64);
+        let data = unsafe { Data::<Row>::from_data_ptr(ptr, 64) };
+        assert!(data.is_empty());
+        assert_eq!(data.len(), 0);
     }
 }
 

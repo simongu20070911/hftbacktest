@@ -284,25 +284,27 @@ impl L2MarketDepth for ROIVectorMarketDepth {
                             }
                         }
                     }
-                    let low_bid_tick = if self.low_bid_tick == INVALID_MAX {
-                        self.roi_lb
-                    } else {
-                        self.low_bid_tick
-                    };
-                    let clear_upto = if clear_upto - 1 < self.roi_lb {
-                        self.roi_lb
-                    } else if clear_upto - 1 > self.roi_ub {
-                        self.roi_ub
-                    } else {
-                        clear_upto - 1
-                    };
-                    self.best_bid_tick = depth_below(
-                        &self.bid_depth,
-                        clear_upto,
-                        low_bid_tick,
-                        self.roi_lb,
-                        self.roi_ub,
-                    );
+                    if self.best_bid_tick != INVALID_MIN && clear_upto <= self.best_bid_tick {
+                        let low_bid_tick = if self.low_bid_tick == INVALID_MAX {
+                            self.roi_lb
+                        } else {
+                            self.low_bid_tick
+                        };
+                        let clear_upto = if clear_upto < self.roi_lb {
+                            self.roi_lb
+                        } else if clear_upto > self.roi_ub {
+                            self.roi_ub
+                        } else {
+                            clear_upto
+                        };
+                        self.best_bid_tick = depth_below(
+                            &self.bid_depth,
+                            clear_upto,
+                            low_bid_tick,
+                            self.roi_lb,
+                            self.roi_ub,
+                        );
+                    }
                 } else {
                     self.bid_depth.iter_mut().for_each(|q| *q = 0.0);
                     self.best_bid_tick = INVALID_MIN;
@@ -316,32 +318,34 @@ impl L2MarketDepth for ROIVectorMarketDepth {
                     let clear_upto = (clear_upto_price / self.tick_size).round() as i64;
                     if self.best_ask_tick != INVALID_MAX {
                         let from = self.best_ask_tick - self.roi_lb;
-                        let to = (clear_upto + 1 - self.roi_ub).min(self.ask_depth.len() as i64);
+                        let to = (clear_upto + 1 - self.roi_lb).min(self.ask_depth.len() as i64);
                         for t in from..to {
                             unsafe {
                                 *self.ask_depth.get_unchecked_mut(t as usize) = 0.0;
                             }
                         }
                     }
-                    let high_ask_tick = if self.high_ask_tick == INVALID_MIN {
-                        self.roi_ub
-                    } else {
-                        self.high_ask_tick
-                    };
-                    let clear_upto = if clear_upto + 1 < self.roi_lb {
-                        self.roi_lb
-                    } else if clear_upto + 1 > self.roi_ub {
-                        self.roi_ub
-                    } else {
-                        clear_upto + 1
-                    };
-                    self.best_ask_tick = depth_above(
-                        &self.ask_depth,
-                        clear_upto,
-                        high_ask_tick,
-                        self.roi_lb,
-                        self.roi_ub,
-                    );
+                    if self.best_ask_tick != INVALID_MAX && clear_upto >= self.best_ask_tick {
+                        let high_ask_tick = if self.high_ask_tick == INVALID_MIN {
+                            self.roi_ub
+                        } else {
+                            self.high_ask_tick
+                        };
+                        let clear_upto = if clear_upto < self.roi_lb {
+                            self.roi_lb
+                        } else if clear_upto > self.roi_ub {
+                            self.roi_ub
+                        } else {
+                            clear_upto
+                        };
+                        self.best_ask_tick = depth_above(
+                            &self.ask_depth,
+                            clear_upto,
+                            high_ask_tick,
+                            self.roi_lb,
+                            self.roi_ub,
+                        );
+                    }
                 } else {
                     self.ask_depth.iter_mut().for_each(|q| *q = 0.0);
                     self.best_ask_tick = INVALID_MAX;
@@ -805,7 +809,7 @@ impl L3MarketDepth for ROIVectorMarketDepth {
 #[cfg(test)]
 mod tests {
     use crate::{
-        depth::{INVALID_MAX, INVALID_MIN, L3MarketDepth, MarketDepth, ROIVectorMarketDepth},
+        depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, L3MarketDepth, MarketDepth, ROIVectorMarketDepth},
         types::Side,
     };
 
@@ -816,6 +820,31 @@ mod tests {
                 ($b / $lot_size).round() as i64
             );
         }};
+    }
+
+    #[test]
+    fn test_l2_clear_depth_sell_clears_and_recomputes_best_ask() {
+        let mut depth = ROIVectorMarketDepth::new(1.0, 1.0, 0.0, 10.0);
+
+        depth.update_ask_depth(5.0, 1.0, 0);
+        depth.update_ask_depth(6.0, 1.0, 0);
+        assert_eq!(depth.best_ask_tick(), 5);
+
+        depth.clear_depth(Side::Sell, 5.0);
+        assert_eq!(depth.best_ask_tick(), 6);
+        assert_eq!(depth.ask_qty_at_tick(5), 0.0);
+    }
+
+    #[test]
+    fn test_l2_clear_depth_buy_does_not_move_best_when_clear_above_roi_ub() {
+        let mut depth = ROIVectorMarketDepth::new(1.0, 1.0, 0.0, 10.0);
+
+        depth.update_bid_depth(10.0, 1.0, 0);
+        depth.update_bid_depth(9.0, 1.0, 0);
+        assert_eq!(depth.best_bid_tick(), 10);
+
+        depth.clear_depth(Side::Buy, 11.0);
+        assert_eq!(depth.best_bid_tick(), 10);
     }
 
     #[test]

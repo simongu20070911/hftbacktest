@@ -110,8 +110,14 @@ where
         order.local_timestamp = current_timestamp;
         self.orders.insert(order.order_id, order.clone());
 
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+        order.maker = false;
         self.order_l2e.request(order, |order| {
             order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
         });
 
         Ok(())
@@ -143,10 +149,17 @@ where
         order.req = Status::Replaced;
         order.local_timestamp = current_timestamp;
 
-        self.order_l2e.request(order.clone(), |order| {
+        let mut req_order = order.clone();
+        req_order.exec_qty = 0.0;
+        req_order.exec_price_tick = 0;
+        req_order.maker = false;
+        self.order_l2e.request(req_order, |order| {
             order.req = Status::Rejected;
             order.price_tick = orig_price_tick;
             order.qty = orig_qty;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
         });
 
         Ok(())
@@ -165,8 +178,15 @@ where
         order.req = Status::Canceled;
         order.local_timestamp = current_timestamp;
 
-        self.order_l2e.request(order.clone(), |order| {
+        let mut req_order = order.clone();
+        req_order.exec_qty = 0.0;
+        req_order.exec_price_tick = 0;
+        req_order.maker = false;
+        self.order_l2e.request(req_order, |order| {
             order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
         });
 
         Ok(())
@@ -279,7 +299,7 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
+            if order.exec_qty > 0.0 {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
@@ -288,11 +308,11 @@ where
                     let local_order = entry.get_mut();
                     if order.req == Status::Rejected {
                         if order.local_timestamp == local_order.local_timestamp {
-                            if local_order.req == Status::New {
-                                local_order.req = Status::None;
+                            let prev_req = local_order.req;
+                            local_order.update(&order);
+                            local_order.req = Status::None;
+                            if prev_req == Status::New {
                                 local_order.status = Status::Expired;
-                            } else {
-                                local_order.req = Status::None;
                             }
                         }
                     } else {

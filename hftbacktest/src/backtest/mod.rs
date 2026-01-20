@@ -1148,21 +1148,41 @@ mod test {
             Backtest,
             DataSource,
             ExchangeKind::NoPartialFillExchange,
+            ExchangeKind::PartialFillExchange,
             L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
             models::{
                 CommonFees,
                 ConstantLatency,
+                LatencyModel,
                 PowerProbQueueFunc3,
                 ProbQueueModel,
+                RiskAdverseQueueModel,
                 TradingValueFeeModel,
             },
         },
         depth::HashMapMarketDepth,
         prelude::{Bot, Event},
-        types::{EXCH_EVENT, LOCAL_EVENT},
+        types::{EXCH_ASK_DEPTH_SNAPSHOT_EVENT, EXCH_EVENT, LOCAL_EVENT, OrdType, Order, Status, TimeInForce},
     };
+
+    #[derive(Clone)]
+    struct RejectModifyLatency;
+
+    impl LatencyModel for RejectModifyLatency {
+        fn entry(&mut self, _timestamp: i64, order: &Order) -> i64 {
+            if order.req == Status::Replaced {
+                -1
+            } else {
+                0
+            }
+        }
+
+        fn response(&mut self, _timestamp: i64, _order: &Order) -> i64 {
+            0
+        }
+    }
 
     #[test]
     fn skips_unseen_events() -> Result<(), Box<dyn Error>> {
@@ -1236,6 +1256,111 @@ mod test {
         backtester.elapse_bt(1)?;
         assert_eq!(3, backtester.cur_ts);
 
+        Ok(())
+    }
+
+    #[test]
+    fn partialfillexchange_multilevel_fill_on_accept_is_accounted() -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 100.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 2.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        // Processes initial depth events at timestamp 0.
+        let _ = backtester.elapse_bt(0)?;
+
+        backtester.submit_buy_order(
+            0,
+            1,
+            101.0,
+            3.0,
+            TimeInForce::IOC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        let values = backtester.state_values(0);
+        assert_eq!(3.0, values.position);
+        assert_eq!(-302.0, values.balance);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_modify_rolls_back_local_order_fields() -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(RejectModifyLatency)
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let _ = backtester.elapse_bt(0)?;
+
+        backtester.submit_buy_order(
+            0,
+            1,
+            10.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        backtester.modify(0, 1, 12.0, 2.0, true)?;
+
+        let order = backtester.orders(0).get(&1).unwrap();
+        assert_eq!(10, order.price_tick);
+        assert_eq!(1.0, order.qty);
         Ok(())
     }
 }

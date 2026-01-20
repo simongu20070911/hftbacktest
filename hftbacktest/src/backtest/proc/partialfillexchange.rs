@@ -240,6 +240,9 @@ where
 
         if MAKE_RESPONSE {
             self.order_e2l.respond(order.clone());
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
         }
         Ok(())
     }
@@ -419,7 +422,7 @@ where
                                         let qty = self.depth.ask_qty_at_tick(t);
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
-                                            self.fill::<false>(
+                                            self.fill::<true>(
                                                 order, timestamp, false, t, exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
@@ -440,7 +443,7 @@ where
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -456,7 +459,7 @@ where
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -468,7 +471,7 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<true>(order, timestamp, false, price_tick, leaves_qty)
                             }
                             TimeInForce::Unsupported => Err(BacktestError::InvalidOrderRequest),
                         }
@@ -505,7 +508,7 @@ where
                         let qty = self.depth.ask_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());
@@ -547,7 +550,7 @@ where
                                         let qty = self.depth.bid_qty_at_tick(t);
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
-                                            self.fill::<false>(
+                                            self.fill::<true>(
                                                 order, timestamp, false, t, exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
@@ -568,7 +571,7 @@ where
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -584,7 +587,7 @@ where
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -596,7 +599,7 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<true>(order, timestamp, false, price_tick, leaves_qty)
                             }
                             _ => {
                                 unreachable!();
@@ -636,7 +639,7 @@ where
                         let qty = self.depth.bid_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());

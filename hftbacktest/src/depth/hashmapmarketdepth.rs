@@ -206,7 +206,7 @@ impl L2MarketDepth for HashMapMarketDepth {
                         }
                     }
                     self.best_bid_tick =
-                        depth_below(&self.bid_depth, clear_upto - 1, self.low_bid_tick);
+                        depth_below(&self.bid_depth, clear_upto, self.low_bid_tick);
                 } else {
                     self.bid_depth.clear();
                     self.best_bid_tick = INVALID_MIN;
@@ -226,7 +226,7 @@ impl L2MarketDepth for HashMapMarketDepth {
                         }
                     }
                     self.best_ask_tick =
-                        depth_above(&self.ask_depth, clear_upto + 1, self.high_ask_tick);
+                        depth_above(&self.ask_depth, clear_upto, self.high_ask_tick);
                 } else {
                     self.ask_depth.clear();
                     self.best_ask_tick = INVALID_MAX;
@@ -619,7 +619,7 @@ impl L3MarketDepth for HashMapMarketDepth {
 #[cfg(test)]
 mod tests {
     use crate::{
-        depth::{HashMapMarketDepth, INVALID_MAX, INVALID_MIN, L3MarketDepth, MarketDepth},
+        depth::{HashMapMarketDepth, INVALID_MAX, INVALID_MIN, L2MarketDepth, L3MarketDepth, MarketDepth},
         types::Side,
     };
 
@@ -630,6 +630,30 @@ mod tests {
                 ($b / $lot_size).round() as i64
             );
         }};
+    }
+
+    #[test]
+    fn test_l2_clear_depth_buy_best_recompute_includes_current_best() {
+        let mut depth = HashMapMarketDepth::new(1.0, 1.0);
+
+        depth.update_bid_depth(100.0, 1.0, 0);
+        depth.update_bid_depth(99.0, 1.0, 0);
+        assert_eq!(depth.best_bid_tick(), 100);
+
+        depth.clear_depth(Side::Buy, 101.0);
+        assert_eq!(depth.best_bid_tick(), 100);
+    }
+
+    #[test]
+    fn test_l2_clear_depth_sell_best_recompute_includes_current_best() {
+        let mut depth = HashMapMarketDepth::new(1.0, 1.0);
+
+        depth.update_ask_depth(100.0, 1.0, 0);
+        depth.update_ask_depth(101.0, 1.0, 0);
+        assert_eq!(depth.best_ask_tick(), 100);
+
+        depth.clear_depth(Side::Sell, 99.0);
+        assert_eq!(depth.best_ask_tick(), 100);
     }
 
     #[test]

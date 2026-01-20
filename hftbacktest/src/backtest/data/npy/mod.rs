@@ -63,12 +63,19 @@ impl NpyHeader {
         let (_, header) = parser::parse::<(&str, nom::error::ErrorKind)>(header)
             .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
         let dict = header.get_dict()?;
-        let mut descr = Vec::new();
-        let mut fortran_order = false;
-        let mut shape = Vec::new();
+        let mut descr: Option<Vec<Field>> = None;
+        let mut fortran_order: Option<bool> = None;
+        let mut shape: Option<Vec<usize>> = None;
         for (key, value) in dict {
             match key.as_str() {
                 "descr" => {
+                    if descr.is_some() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "duplicate header key: descr".to_string(),
+                        ));
+                    }
+                    let mut fields = Vec::new();
                     let list = value.get_list()?;
                     for item in list {
                         let tuple = item.get_list()?;
@@ -76,7 +83,7 @@ impl NpyHeader {
                             2 => {
                                 match (&tuple[0], &tuple[1]) {
                                     (Value::String(name), Value::String(dtype)) => {
-                                        descr.push(Field {
+                                        fields.push(Field {
                                             name: name.clone(),
                                             ty: dtype.clone(),
                                         });
@@ -96,23 +103,68 @@ impl NpyHeader {
                             }
                         }
                     }
+                    if fields.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "descr must not be empty".to_string(),
+                        ));
+                    }
+                    descr = Some(fields);
                 }
                 "fortran_order" => {
-                    fortran_order = value.get_bool()?;
+                    if fortran_order.is_some() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "duplicate header key: fortran_order".to_string(),
+                        ));
+                    }
+                    fortran_order = Some(value.get_bool()?);
                 }
                 "shape" => {
-                    for num in value.get_list()? {
-                        shape.push(num.get_integer()?);
+                    if shape.is_some() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "duplicate header key: shape".to_string(),
+                        ));
                     }
+                    let mut dims = Vec::new();
+                    for num in value.get_list()? {
+                        dims.push(num.get_integer()?);
+                    }
+                    if dims.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "shape must not be empty".to_string(),
+                        ));
+                    }
+                    shape = Some(dims);
                 }
                 _ => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        "must be a list".to_string(),
+                        format!("unexpected header key: {key}"),
                     ));
                 }
             }
         }
+        let descr = descr.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "missing required header key: descr".to_string(),
+            )
+        })?;
+        let fortran_order = fortran_order.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "missing required header key: fortran_order".to_string(),
+            )
+        })?;
+        let shape = shape.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "missing required header key: shape".to_string(),
+            )
+        })?;
         Ok(NpyHeader {
             descr,
             fortran_order,
@@ -150,6 +202,13 @@ fn check_field_consistency(
     found_types: &DType,
 ) -> Result<Vec<FieldCheckResult>, String> {
     let mut discrepancies = vec![];
+    if expected_types.len() != found_types.len() {
+        return Err(format!(
+            "Field count mismatch: expected {}, but found {}",
+            expected_types.len(),
+            found_types.len()
+        ));
+    }
     for (expected, found) in expected_types.iter().zip(found_types.iter()) {
         if expected.ty != found.ty {
             return Err(format!(
@@ -236,29 +295,72 @@ pub fn read_npy<R: Read, D: NpyDTyped + Clone>(
     reader: &mut R,
     size: usize,
 ) -> std::io::Result<Data<D>> {
-    let mut buf = DataPtr::new(size);
-
-    let mut read_size = 0;
-    while read_size < size {
-        read_size += reader.read(&mut buf[read_size..])?;
+    if size == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "empty input",
+        ));
     }
 
-    if buf[0..6].to_vec() != b"\x93NUMPY" {
+    // Minimum size for v1.0 header: magic(6) + ver(2) + header_len(2).
+    if size < 10 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "file too small to be a valid .npy",
+        ));
+    }
+
+    let mut buf = DataPtr::new(size);
+    reader.read_exact(&mut buf[..])?;
+
+    let bytes = &buf[..];
+    if bytes.get(0..6) != Some(b"\x93NUMPY") {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "must start with \\x93NUMPY",
         ));
     }
-    if buf[6..8].to_vec() != b"\x01\x00" {
+    if bytes.get(6..8) != Some(b"\x01\x00") {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "support only version 1.0",
         ));
     }
-    let header_len = u16::from_le_bytes(buf[8..10].try_into().unwrap()) as usize;
-    let header = String::from_utf8(buf[10..(10 + header_len)].to_vec())
+
+    let header_len = {
+        let header_len_bytes = bytes.get(8..10).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "missing .npy header length",
+            )
+        })?;
+        let mut arr = [0u8; 2];
+        arr.copy_from_slice(header_len_bytes);
+        u16::from_le_bytes(arr) as usize
+    };
+
+    let data_offset = 10usize
+        .checked_add(header_len)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "header length overflow"))?;
+    if data_offset > size {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated .npy header",
+        ));
+    }
+    let header_bytes = bytes
+        .get(10..data_offset)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "truncated .npy header"))?;
+    if !header_bytes.ends_with(b"\n") {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "header must end with newline",
+        ));
+    }
+
+    let header_str = std::str::from_utf8(header_bytes)
         .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
-    let header = NpyHeader::from_header(&header).unwrap();
+    let header = NpyHeader::from_header(header_str)?;
 
     if header.fortran_order {
         return Err(Error::new(
@@ -267,8 +369,9 @@ pub fn read_npy<R: Read, D: NpyDTyped + Clone>(
         ));
     }
 
-    if D::descr() != header.descr {
-        match check_field_consistency(&D::descr(), &header.descr) {
+    let expected_descr = D::descr();
+    if expected_descr != header.descr {
+        match check_field_consistency(&expected_descr, &header.descr) {
             Ok(diff) => {
                 println!("Warning: Field name mismatch - {diff:?}");
             }
@@ -282,15 +385,167 @@ pub fn read_npy<R: Read, D: NpyDTyped + Clone>(
         return Err(Error::new(ErrorKind::InvalidData, "only 1-d is supported"));
     }
 
-    if !(10 + header_len).is_multiple_of(CACHE_LINE_SIZE) {
+    if !data_offset.is_multiple_of(CACHE_LINE_SIZE) {
         return Err(Error::new(
             ErrorKind::InvalidData,
             format!("Not aligned with cache line size ({CACHE_LINE_SIZE} bytes)."),
         ));
     }
 
-    let data = unsafe { Data::from_data_ptr(buf, 10 + header_len) };
+    let d_align = std::mem::align_of::<D>();
+    if d_align > CACHE_LINE_SIZE {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "alignment of record type ({d_align}) exceeds cache line size ({CACHE_LINE_SIZE})"
+            ),
+        ));
+    }
+    if data_offset % d_align != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "data offset is not aligned for record type",
+        ));
+    }
+
+    let payload_len = size - data_offset;
+    let record_size = std::mem::size_of::<D>();
+    if record_size == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "zero-sized record types are unsupported",
+        ));
+    }
+    if payload_len % record_size != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "data payload is truncated (not a whole number of records)",
+        ));
+    }
+    let record_count = payload_len / record_size;
+    if header.shape[0] != record_count {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "shape mismatch: header has {}, but payload has {record_count} records",
+                header.shape[0]
+            ),
+        ));
+    }
+
+    let data = unsafe { Data::from_data_ptr(buf, data_offset) };
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Row1 {
+        a: i64,
+    }
+    unsafe impl POD for Row1 {}
+    impl NpyDTyped for Row1 {
+        fn descr() -> DType {
+            vec![Field {
+                name: "a".to_string(),
+                ty: "<i8".to_string(),
+            }]
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Row2 {
+        a: i64,
+        b: i64,
+    }
+    unsafe impl POD for Row2 {}
+    impl NpyDTyped for Row2 {
+        fn descr() -> DType {
+            vec![
+                Field {
+                    name: "a".to_string(),
+                    ty: "<i8".to_string(),
+                },
+                Field {
+                    name: "b".to_string(),
+                    ty: "<i8".to_string(),
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn read_npy_rejects_empty_input() {
+        let mut cursor = Cursor::new(Vec::new());
+        let err = read_npy::<_, Row1>(&mut cursor, 0).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_npy_does_not_hang_on_premature_eof() {
+        let mut buf = Vec::new();
+        write_npy(&mut buf, &[Row1 { a: 1 }]).unwrap();
+
+        // Claim the file is longer than it actually is; the old loop would spin forever once
+        // `read()` started returning Ok(0).
+        let mut cursor = Cursor::new(buf);
+        let size = cursor.get_ref().len();
+        let err = read_npy::<_, Row1>(&mut cursor, size + 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_npy_rejects_truncated_header_by_len() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // header_len = 1, but no header bytes follow.
+
+        let mut cursor = Cursor::new(bytes);
+        let size = cursor.get_ref().len();
+        let err = read_npy::<_, Row1>(&mut cursor, size).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_npy_rejects_field_count_mismatch() {
+        let mut buf = Vec::new();
+        write_npy(&mut buf, &[Row2 { a: 1, b: 2 }]).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let size = cursor.get_ref().len();
+        let err = read_npy::<_, Row1>(&mut cursor, size).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn from_header_rejects_missing_required_keys() {
+        let err = NpyHeader::from_header("{'fortran_order': False, 'shape': (1,)}").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let err = NpyHeader::from_header("{'descr': [('a','<i8')], 'shape': (1,)}").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let err =
+            NpyHeader::from_header("{'descr': [('a','<i8')], 'fortran_order': False}").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_npy_rejects_truncated_payload_partial_record() {
+        let mut buf = Vec::new();
+        write_npy(&mut buf, &[Row1 { a: 1 }]).unwrap();
+        buf.pop(); // truncate by 1 byte
+
+        let mut cursor = Cursor::new(buf);
+        let size = cursor.get_ref().len();
+        let err = read_npy::<_, Row1>(&mut cursor, size).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
 }
 
 /// Reads a structured array `numpy` file. Currently, it doesn't check if the data structure is the

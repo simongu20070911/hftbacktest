@@ -70,7 +70,7 @@ impl L2MarketDepth for BTreeMarketDepth {
     ) -> (i64, i64, i64, f64, f64, i64) {
         let price_tick = (price / self.tick_size).round() as i64;
         let prev_best_bid_tick = *self.bid_depth.keys().last().unwrap_or(&INVALID_MIN);
-        let prev_qty = *self.bid_depth.get(&prev_best_bid_tick).unwrap_or(&0.0);
+        let prev_qty = *self.bid_depth.get(&price_tick).unwrap_or(&0.0);
 
         if (qty / self.lot_size).round() as i64 == 0 {
             self.bid_depth.remove(&price_tick);
@@ -96,7 +96,7 @@ impl L2MarketDepth for BTreeMarketDepth {
     ) -> (i64, i64, i64, f64, f64, i64) {
         let price_tick = (price / self.tick_size).round() as i64;
         let prev_best_ask_tick = *self.ask_depth.keys().next().unwrap_or(&INVALID_MAX);
-        let prev_qty = *self.ask_depth.get(&prev_best_ask_tick).unwrap_or(&0.0);
+        let prev_qty = *self.ask_depth.get(&price_tick).unwrap_or(&0.0);
 
         if (qty / self.lot_size).round() as i64 == 0 {
             self.ask_depth.remove(&price_tick);
@@ -305,11 +305,11 @@ impl L3MarketDepth for BTreeMarketDepth {
             let prev_best_tick = self.best_bid_tick;
 
             let depth_qty = self.bid_depth.get_mut(&order.price_tick).unwrap();
-            *depth_qty -= order.qty;
+                *depth_qty -= order.qty;
             if (*depth_qty / self.lot_size).round() as i64 == 0 {
                 self.bid_depth.remove(&order.price_tick).unwrap();
                 if order.price_tick == self.best_bid_tick {
-                    self.best_bid_tick = *self.bid_depth.keys().next().unwrap_or(&INVALID_MIN);
+                    self.best_bid_tick = *self.bid_depth.keys().last().unwrap_or(&INVALID_MIN);
                 }
             }
             Ok((Side::Buy, prev_best_tick, self.best_bid_tick))
@@ -444,7 +444,7 @@ impl L3MarketDepth for BTreeMarketDepth {
 #[cfg(test)]
 mod tests {
     use crate::{
-        depth::{BTreeMarketDepth, INVALID_MAX, INVALID_MIN, L3MarketDepth, MarketDepth},
+        depth::{BTreeMarketDepth, INVALID_MAX, INVALID_MIN, L2MarketDepth, L3MarketDepth, MarketDepth},
         types::Side,
     };
 
@@ -667,5 +667,64 @@ mod tests {
         assert_eq!(depth.best_ask_tick(), 5001);
         assert_eq_qty!(depth.ask_qty_at_tick(4981), 0.0, lot_size);
         assert_eq_qty!(depth.ask_qty_at_tick(5002), 0.002, lot_size);
+    }
+
+    #[test]
+    fn test_l2_update_bid_depth_prev_qty_is_at_price_tick() {
+        let lot_size = 0.001;
+        let mut depth = BTreeMarketDepth::new(0.1, lot_size);
+
+        let (_price_tick, _prev_best_tick, _best_tick, prev_qty, _qty, _ts) =
+            depth.update_bid_depth(500.1, 0.001, 0);
+        assert_eq_qty!(prev_qty, 0.0, lot_size);
+
+        let (_price_tick, _prev_best_tick, _best_tick, prev_qty, _qty, _ts) =
+            depth.update_bid_depth(500.3, 0.005, 0);
+        assert_eq_qty!(prev_qty, 0.0, lot_size);
+
+        let (price_tick, prev_best_tick, best_tick, prev_qty, _qty, _ts) =
+            depth.update_bid_depth(500.1, 0.002, 0);
+        assert_eq!(price_tick, 5001);
+        assert_eq!(prev_best_tick, 5003);
+        assert_eq!(best_tick, 5003);
+        assert_eq_qty!(prev_qty, 0.001, lot_size);
+    }
+
+    #[test]
+    fn test_l2_update_ask_depth_prev_qty_is_at_price_tick() {
+        let lot_size = 0.001;
+        let mut depth = BTreeMarketDepth::new(0.1, lot_size);
+
+        let (_price_tick, _prev_best_tick, _best_tick, prev_qty, _qty, _ts) =
+            depth.update_ask_depth(500.1, 0.001, 0);
+        assert_eq_qty!(prev_qty, 0.0, lot_size);
+
+        let (_price_tick, _prev_best_tick, _best_tick, prev_qty, _qty, _ts) =
+            depth.update_ask_depth(499.9, 0.002, 0);
+        assert_eq_qty!(prev_qty, 0.0, lot_size);
+
+        let (price_tick, prev_best_tick, best_tick, prev_qty, _qty, _ts) =
+            depth.update_ask_depth(500.1, 0.003, 0);
+        assert_eq!(price_tick, 5001);
+        assert_eq!(prev_best_tick, 4999);
+        assert_eq!(best_tick, 4999);
+        assert_eq_qty!(prev_qty, 0.001, lot_size);
+    }
+
+    #[test]
+    fn test_l3_delete_buy_order_best_recomputes_to_max_remaining() {
+        let lot_size = 0.001;
+        let mut depth = BTreeMarketDepth::new(0.1, lot_size);
+
+        depth.add_buy_order(1, 500.1, 0.001, 0).unwrap();
+        depth.add_buy_order(2, 500.3, 0.001, 0).unwrap();
+        depth.add_buy_order(3, 500.5, 0.001, 0).unwrap();
+        assert_eq!(depth.best_bid_tick(), 5005);
+
+        let (side, prev_best, best) = depth.delete_order(3, 0).unwrap();
+        assert_eq!(side, Side::Buy);
+        assert_eq!(prev_best, 5005);
+        assert_eq!(best, 5003);
+        assert_eq!(depth.best_bid_tick(), 5003);
     }
 }

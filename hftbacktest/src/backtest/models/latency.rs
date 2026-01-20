@@ -1,4 +1,7 @@
-use std::{io::Error as IoError, mem};
+use std::{
+    io::{Error as IoError, ErrorKind},
+    mem,
+};
 
 use hftbacktest_derive::NpyDTyped;
 
@@ -286,10 +289,79 @@ impl OrderLatencyAdjustment {
 
 impl DataPreprocess<OrderLatencyRow> for OrderLatencyAdjustment {
     fn preprocess(&self, data: &mut Data<OrderLatencyRow>) -> Result<(), IoError> {
+        let resp_offset = self
+            .latency_offset
+            .checked_add(self.latency_offset)
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "`latency_offset` overflowed while doubling for response timestamp adjustment",
+                )
+            })?;
         for i in 0..data.len() {
-            data[i].exch_ts += self.latency_offset;
-            data[i].resp_ts += self.latency_offset + self.latency_offset;
+            let row = &mut data[i];
+            row.exch_ts = row.exch_ts.checked_add(self.latency_offset).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "`exch_ts` overflowed while applying the latency offset",
+                )
+            })?;
+            row.resp_ts = row.resp_ts.checked_add(resp_offset).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "`resp_ts` overflowed while applying the latency offset",
+                )
+            })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn order_latency_adjustment_detects_exch_ts_overflow() {
+        let adjustment = OrderLatencyAdjustment::new(1);
+        let mut data = Data::from_data(&[OrderLatencyRow {
+            req_ts: 0,
+            exch_ts: i64::MAX,
+            resp_ts: 0,
+            _padding: 0,
+        }]);
+
+        let err = adjustment.preprocess(&mut data).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn order_latency_adjustment_detects_resp_ts_overflow() {
+        let adjustment = OrderLatencyAdjustment::new(1);
+        let mut data = Data::from_data(&[OrderLatencyRow {
+            req_ts: 0,
+            exch_ts: 0,
+            resp_ts: i64::MAX - 1,
+            _padding: 0,
+        }]);
+
+        let err = adjustment.preprocess(&mut data).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn order_latency_adjustment_detects_offset_doubling_overflow() {
+        let adjustment = OrderLatencyAdjustment::new(i64::MAX);
+        let mut data = Data::from_data(&[OrderLatencyRow {
+            req_ts: 0,
+            exch_ts: 0,
+            resp_ts: 0,
+            _padding: 0,
+        }]);
+
+        let err = adjustment.preprocess(&mut data).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 }

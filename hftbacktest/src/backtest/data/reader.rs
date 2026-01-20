@@ -480,8 +480,14 @@ impl FeedLatencyAdjustment {
 impl DataPreprocess<Event> for FeedLatencyAdjustment {
     fn preprocess(&self, data: &mut Data<Event>) -> Result<(), IoError> {
         for i in 0..data.len() {
-            data[i].local_ts += self.latency_offset;
-            if data[i].local_ts <= data[i].exch_ts {
+            let row = &mut data[i];
+            row.local_ts = row.local_ts.checked_add(self.latency_offset).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "`local_ts` overflowed while applying the latency offset",
+                )
+            })?;
+            if row.local_ts <= row.exch_ts {
                 return Err(IoError::new(
                     ErrorKind::InvalidData,
                     "`local_ts` became less than or \
@@ -490,5 +496,30 @@ impl DataPreprocess<Event> for FeedLatencyAdjustment {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn feed_latency_adjustment_detects_timestamp_overflow() {
+        let adjustment = FeedLatencyAdjustment::new(1);
+        let mut data = Data::from_data(&[Event {
+            ev: 0,
+            exch_ts: 0,
+            local_ts: i64::MAX,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let err = adjustment.preprocess(&mut data).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 }
