@@ -5,7 +5,6 @@ use std::{
     marker::PhantomData,
     mem::size_of,
     ops::{Index, IndexMut},
-    ptr::null_mut,
     rc::Rc,
     slice::SliceIndex,
 };
@@ -47,11 +46,20 @@ impl<D> Data<D>
 where
     D: POD + Clone,
 {
+    #[inline(always)]
+    fn elem_size() -> usize {
+        size_of::<D>()
+    }
+
     /// Returns the length of the array.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        let size = size_of::<D>();
-        (self.ptr.len() - self.offset) / size
+        let size = Self::elem_size();
+        if size == 0 {
+            return 0;
+        }
+
+        self.ptr.len().saturating_sub(self.offset) / size
     }
 
     /// Returns `true` if the `Data` is empty.
@@ -121,6 +129,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
@@ -144,6 +153,54 @@ mod tests {
         assert!(data.is_empty());
         assert_eq!(data.len(), 0);
     }
+
+    #[test]
+    fn dataptr_default_is_non_null() {
+        let ptr = DataPtr::default();
+        let thin = ptr.ptr as *const u8;
+        assert!(!thin.is_null());
+        assert_eq!(ptr.len(), 0);
+    }
+
+    #[test]
+    fn data_empty_index_panics() {
+        let data = Data::<Row>::empty();
+        let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _ = data[0];
+        }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn data_index_large_panics_with_bounds_message() {
+        let data = Data::<Row>::from_data(&[Row { a: 1 }]);
+        let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _ = data[usize::MAX];
+        }))
+        .expect_err("expected panic");
+
+        let msg = if let Some(s) = err.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "<non-string panic>"
+        };
+        assert!(
+            msg.contains("Out of the size."),
+            "unexpected panic message: {msg}"
+        );
+    }
+
+    #[test]
+    fn data_index_mut_is_copy_on_write() {
+        let base = Data::<Row>::from_data(&[Row { a: 1 }, Row { a: 2 }]);
+        let mut left = base.clone();
+        let right = base.clone();
+
+        left[0].a = 10;
+        assert_eq!(right[0].a, 1);
+    }
 }
 
 impl<D> Index<usize> for Data<D>
@@ -154,11 +211,13 @@ where
 
     #[inline(always)]
     fn index(&self, index: usize) -> &Self::Output {
-        let size = size_of::<D>();
-        let i = self.offset + index * size;
-        if i + size > self.ptr.len() {
+        let len = self.len();
+        if index >= len {
             panic!("Out of the size.");
         }
+
+        let size = Self::elem_size();
+        let i = self.offset + index * size;
         unsafe { &*(self.ptr.at(i) as *const D) }
     }
 }
@@ -168,11 +227,17 @@ where
     D: POD + Clone,
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        let size = size_of::<D>();
-        let i = self.offset + index * size;
-        if i + size > self.ptr.len() {
+        let len = self.len();
+        if index >= len {
             panic!("Out of the size.");
         }
+
+        if Rc::get_mut(&mut self.ptr).is_none() {
+            self.ptr = Rc::new(self.ptr.to_managed_copy());
+        }
+
+        let size = Self::elem_size();
+        let i = self.offset + index * size;
         unsafe { &mut *(self.ptr.at(i) as *mut D) }
     }
 }
@@ -222,12 +287,25 @@ impl DataPtr {
         let ptr = self.ptr as *const u8;
         unsafe { ptr.add(index) }
     }
+
+    #[inline]
+    fn to_managed_copy(&self) -> Self {
+        let copied = DataPtr::new(self.len());
+
+        unsafe {
+            let src = self.ptr.as_ref().expect("source pointer must be non-null");
+            let dest = copied.ptr.as_mut().expect("destination pointer must be non-null");
+            dest.copy_from_slice(src);
+        }
+
+        copied
+    }
 }
 
 impl Default for DataPtr {
     fn default() -> Self {
         Self {
-            ptr: null_mut::<[u8; 0]>() as *mut [u8],
+            ptr: std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::<u8>::dangling().as_ptr(), 0),
             managed: false,
         }
     }

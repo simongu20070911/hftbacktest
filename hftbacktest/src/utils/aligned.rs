@@ -3,7 +3,7 @@ use std::{
     borrow::{Borrow, BorrowMut},
     fmt,
     fmt::{Debug, Formatter, Pointer},
-    mem::{forget, size_of},
+    mem::{align_of, forget, needs_drop, size_of},
     ops::{Deref, DerefMut, Index, IndexMut},
     ptr::{NonNull, slice_from_raw_parts_mut},
     slice::SliceIndex,
@@ -19,10 +19,23 @@ pub struct AlignedArray<T, const ALIGNMENT: usize> {
 impl<T, const ALIGNMENT: usize> Drop for AlignedArray<T, ALIGNMENT> {
     #[inline]
     fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
         unsafe {
-            let layout =
-                alloc::Layout::from_size_align_unchecked(self.len * size_of::<T>(), ALIGNMENT);
-            alloc::dealloc(self.ptr.as_ptr() as _, layout);
+            if needs_drop::<T>() {
+                std::ptr::drop_in_place(self.ptr.as_ptr());
+            }
+            if size_of::<T>() == 0 {
+                return;
+            }
+            let Some(byte_len) = size_of::<T>().checked_mul(self.len) else {
+                return;
+            };
+            let Ok(layout) = alloc::Layout::from_size_align(byte_len, ALIGNMENT) else {
+                return;
+            };
+            alloc::dealloc(self.ptr.as_ptr() as *mut T as _, layout);
         }
     }
 }
@@ -35,25 +48,76 @@ impl<T, const ALIGNMENT: usize> AlignedArray<T, ALIGNMENT> {
     pub const MAX_CAPACITY: usize = isize::MAX as usize - (ALIGNMENT - 1);
 
     #[inline]
-    pub fn new(len: usize) -> Self {
-        if len == 0 {
-            panic!("`len` cannot be zero.");
-        } else {
-            assert!(
-                len * size_of::<T>() <= Self::MAX_CAPACITY,
-                "`len * size_of::<T>()` cannot exceed isize::MAX - (ALIGNMENT - 1)"
-            );
-            let ptr = unsafe {
-                let layout =
-                    alloc::Layout::from_size_align_unchecked(len * size_of::<T>(), ALIGNMENT);
-                let ptr = alloc::alloc(layout);
-                if ptr.is_null() {
-                    alloc::handle_alloc_error(layout);
-                }
-                NonNull::new_unchecked(slice_from_raw_parts_mut(ptr as *mut T, len))
-            };
-            Self { ptr, len }
+    pub fn new(len: usize) -> Self
+    where
+        T: Default,
+    {
+        assert!(
+            ALIGNMENT.is_power_of_two(),
+            "`ALIGNMENT` must be a power of two"
+        );
+        assert!(
+            ALIGNMENT >= align_of::<T>(),
+            "`ALIGNMENT` must be >= align_of::<T>()"
+        );
+
+        let byte_len = size_of::<T>()
+            .checked_mul(len)
+            .expect("len * size_of::<T>() overflow");
+        assert!(
+            byte_len <= Self::MAX_CAPACITY,
+            "`len * size_of::<T>()` cannot exceed isize::MAX - (ALIGNMENT - 1)"
+        );
+
+        let layout = alloc::Layout::from_size_align(byte_len, ALIGNMENT)
+            .expect("invalid layout for allocation");
+        if layout.size() == 0 {
+            let ptr = NonNull::<T>::dangling().as_ptr();
+            let ptr = unsafe { NonNull::new_unchecked(slice_from_raw_parts_mut(ptr, len)) };
+            return Self { ptr, len };
         }
+
+        let ptr = unsafe {
+            struct InitGuard<T> {
+                ptr: *mut T,
+                layout: alloc::Layout,
+                init: usize,
+            }
+
+            impl<T> Drop for InitGuard<T> {
+                fn drop(&mut self) {
+                    unsafe {
+                        if needs_drop::<T>() {
+                            let initialized =
+                                slice_from_raw_parts_mut(self.ptr as *mut T, self.init);
+                            std::ptr::drop_in_place(initialized);
+                        }
+                        alloc::dealloc(self.ptr as _, self.layout);
+                    }
+                }
+            }
+
+            let ptr = alloc::alloc(layout);
+            if ptr.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+
+            let ptr = ptr as *mut T;
+            let mut guard = InitGuard {
+                ptr,
+                layout,
+                init: 0,
+            };
+            for i in 0..len {
+                ptr.add(i).write(T::default());
+                guard.init += 1;
+            }
+            forget(guard);
+
+            NonNull::new_unchecked(slice_from_raw_parts_mut(ptr, len))
+        };
+
+        Self { ptr, len }
     }
 
     #[inline]
@@ -169,5 +233,23 @@ impl<T, const ALIGNMENT: usize, Idx: SliceIndex<[T]>> IndexMut<Idx> for AlignedA
     #[inline]
     fn index_mut(&mut self, index: Idx) -> &mut Self::Output {
         &mut self.as_mut_slice()[index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlignedArray, CACHE_LINE_SIZE};
+
+    #[test]
+    fn alignedarray_len_zero_is_allowed() {
+        let arr = AlignedArray::<u8, CACHE_LINE_SIZE>::new(0);
+        assert_eq!(arr.len(), 0);
+        assert!(arr.as_slice().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "len * size_of::<T>() overflow")]
+    fn alignedarray_new_panics_on_len_times_size_overflow() {
+        let _ = AlignedArray::<u16, CACHE_LINE_SIZE>::new(usize::MAX);
     }
 }

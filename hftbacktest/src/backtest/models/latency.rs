@@ -125,16 +125,15 @@ impl IntpOrderLatency {
                 .preprocessor(OrderLatencyAdjustment::new(latency_offset))
                 .build()?
         };
-        let data = match reader.next_data() {
-            Ok(data) => data,
-            Err(BacktestError::EndOfData) => Data::empty(),
-            Err(e) => return Err(e),
-        };
-        let next_data = match reader.next_data() {
-            Ok(data) => data,
-            Err(BacktestError::EndOfData) => Data::empty(),
-            Err(e) => return Err(e),
-        };
+        let data = Self::load_next_non_empty(&mut reader)?;
+        if data.is_empty() {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "order latency dataset is empty",
+            )
+            .into());
+        }
+        let next_data = Self::load_next_non_empty(&mut reader)?;
         Ok(Self {
             entry_rn: 0,
             resp_rn: 0,
@@ -150,16 +149,43 @@ impl IntpOrderLatency {
     }
 
     fn intp(&self, x: i64, x1: i64, y1: i64, x2: i64, y2: i64) -> i64 {
-        (((y2 - y1) as f64) / ((x2 - x1) as f64) * ((x - x1) as f64)) as i64 + y1
+        if x2 == x1 {
+            return y1;
+        }
+
+        // Avoid potential `i64` overflow from `(x2 - x1)` and `(x - x1)` by doing math in `f64`
+        // space, and guard against division-by-zero / NaN / +/-Inf.
+        let dx = (x2 as f64) - (x1 as f64);
+        if dx == 0.0 {
+            return y1;
+        }
+
+        let dy = (y2 as f64) - (y1 as f64);
+        let t = (x as f64) - (x1 as f64);
+        let term = dy / dx * t;
+        if !term.is_finite() {
+            return y1;
+        }
+
+        y1.saturating_add(term as i64)
+    }
+
+    fn load_next_non_empty(
+        reader: &mut Reader<OrderLatencyRow>,
+    ) -> Result<Data<OrderLatencyRow>, BacktestError> {
+        loop {
+            match reader.next_data() {
+                Ok(data) if data.is_empty() => reader.release(data),
+                Ok(data) => return Ok(data),
+                Err(BacktestError::EndOfData) => return Ok(Data::empty()),
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn next_data(&mut self) -> Result<bool, BacktestError> {
         if !self.next_data.is_empty() {
-            let next_data = match self.reader.next_data() {
-                Ok(data) => data,
-                Err(BacktestError::EndOfData) => Data::empty(),
-                Err(e) => return Err(e),
-            };
+            let next_data = Self::load_next_non_empty(&mut self.reader)?;
             let next_data = mem::replace(&mut self.next_data, next_data);
             let data = mem::replace(&mut self.data, next_data);
             self.reader.release(data);
@@ -363,5 +389,36 @@ mod tests {
 
         let err = adjustment.preprocess(&mut data).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn intp_order_latency_build_rejects_empty_dataset() {
+        let err = match IntpOrderLatency::build(vec![], false, 0) {
+            Ok(_) => panic!("expected IntpOrderLatency::build to error on empty dataset"),
+            Err(err) => err,
+        };
+        match err {
+            BacktestError::DataError(err) => assert_eq!(err.kind(), ErrorKind::InvalidData),
+            err => panic!("expected BacktestError::DataError(InvalidData), got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn intp_order_latency_handles_duplicate_x_values_deterministically() {
+        let model = IntpOrderLatency::build(
+            vec![DataSource::Data(Data::from_data(&[OrderLatencyRow {
+                req_ts: 0,
+                exch_ts: 0,
+                resp_ts: 0,
+                _padding: 0,
+            }]))],
+            false,
+            0,
+        )
+        .unwrap();
+
+        // A duplicate timestamp means x1 == x2. The interpolation should not divide by zero or
+        // overflow; instead it should fall back to a deterministic value.
+        assert_eq!(model.intp(1, 0, 0, 0, 1), 0);
     }
 }

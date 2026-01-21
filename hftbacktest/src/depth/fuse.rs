@@ -314,7 +314,7 @@ impl FusedHashMapMarketDepth {
                     }
                 }
             }
-            self.best_bid_tick = depth_below(&self.bid_depth, clear_upto - 1, self.low_bid_tick);
+            self.best_bid_tick = depth_below(&self.bid_depth, clear_upto, self.low_bid_tick);
             if self.best_bid_tick == INVALID_MIN {
                 self.low_bid_tick = INVALID_MAX;
             }
@@ -327,7 +327,7 @@ impl FusedHashMapMarketDepth {
                     }
                 }
             }
-            self.best_ask_tick = depth_above(&self.ask_depth, clear_upto + 1, self.high_ask_tick);
+            self.best_ask_tick = depth_above(&self.ask_depth, clear_upto, self.high_ask_tick);
             if self.best_ask_tick == INVALID_MAX {
                 self.high_ask_tick = INVALID_MIN;
             }
@@ -714,7 +714,7 @@ impl MarketDepth for FusedHashMapMarketDepth {
 mod tests {
     use crate::{
         depth::{FusedHashMapMarketDepth, MarketDepth},
-        types::{BUY_EVENT, DEPTH_EVENT, Event, SELL_EVENT},
+        types::{BUY_EVENT, DEPTH_EVENT, Event, SELL_EVENT, Side},
     };
 
     #[test]
@@ -1357,5 +1357,85 @@ mod tests {
         assert_eq!(depth.best_bid_tick, 103);
         assert_eq!(depth.low_bid_tick, 100);
         assert_eq!(depth.high_ask_tick, 104);
+    }
+
+    #[test]
+    fn test_clear_depth_recompute_does_not_skip_adjacent_bid_tick() {
+        let mut depth = FusedHashMapMarketDepth::new(1.0, 1.0);
+
+        depth.update_bid_depth(Event {
+            ev: BUY_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 99.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        depth.update_bid_depth(Event {
+            ev: BUY_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        depth.update_bid_depth(Event {
+            ev: BUY_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 101.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        assert_eq!(depth.best_bid_tick(), 101);
+
+        depth.clear_depth(Side::Buy, 100.0, 2);
+        assert_eq!(depth.best_bid_tick(), 99);
+    }
+
+    #[test]
+    fn test_clear_depth_recompute_does_not_skip_adjacent_ask_tick() {
+        let mut depth = FusedHashMapMarketDepth::new(1.0, 1.0);
+
+        depth.update_ask_depth(Event {
+            ev: SELL_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 101.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        depth.update_ask_depth(Event {
+            ev: SELL_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 102.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        depth.update_ask_depth(Event {
+            ev: SELL_EVENT | DEPTH_EVENT,
+            exch_ts: 1,
+            local_ts: 1,
+            px: 103.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        });
+        assert_eq!(depth.best_ask_tick(), 101);
+
+        depth.clear_depth(Side::Sell, 102.0, 2);
+        assert_eq!(depth.best_ask_tick(), 103);
     }
 }

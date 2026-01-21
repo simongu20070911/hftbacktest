@@ -460,6 +460,7 @@ where
     }
 
     fn ack_cancel(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
+        let req_local_timestamp = order.local_timestamp;
         let exch_order = {
             let mut order_borrowed = self.orders.borrow_mut();
             order_borrowed.remove(&order.order_id)
@@ -473,6 +474,7 @@ where
 
         let exch_order = exch_order.unwrap();
         let _ = std::mem::replace(order, exch_order);
+        order.local_timestamp = req_local_timestamp;
 
         // Deletes the order.
         if order.side == Side::Buy {
@@ -547,6 +549,9 @@ where
         {
             let mut cancel_order = order.clone();
             self.ack_cancel(&mut cancel_order, timestamp)?;
+            // This modify is processed as cancel+new, so reset the remaining quantity for the new
+            // resting order.
+            order.leaves_qty = order.qty;
             self.ack_new(order, timestamp)?;
             // todo: Status::Replaced or Status::New?
         } else {

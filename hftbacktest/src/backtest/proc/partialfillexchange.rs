@@ -681,6 +681,7 @@ where
     }
 
     fn ack_cancel(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
+        let req_local_timestamp = order.local_timestamp;
         let exch_order = {
             let mut order_borrowed = self.orders.borrow_mut();
             order_borrowed.remove(&order.order_id)
@@ -694,6 +695,7 @@ where
 
         let exch_order = exch_order.unwrap();
         let _ = std::mem::replace(order, exch_order);
+        order.local_timestamp = req_local_timestamp;
 
         // Deletes the order.
         if order.side == Side::Buy {
@@ -768,6 +770,9 @@ where
         {
             let mut cancel_order = order.clone();
             self.ack_cancel(&mut cancel_order, timestamp)?;
+            // This modify is processed as cancel+new, so reset the remaining quantity for the new
+            // resting order.
+            order.leaves_qty = order.qty;
             self.ack_new(order, timestamp)?;
             // todo: Status::Replaced or Status::New?
         } else {
@@ -919,5 +924,105 @@ where
         self.order_e2l
             .earliest_send_order_timestamp()
             .unwrap_or(i64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, ConstantLatency, RiskAdverseQueueModel, TradingValueFeeModel},
+            order::order_bus,
+            proc::{Local, LocalProcessor, Processor},
+            state::State,
+        },
+        depth::HashMapMarketDepth,
+        types::{
+            Event,
+            EXCH_ASK_DEPTH_EVENT,
+            EXCH_BID_DEPTH_EVENT,
+            EXCH_SELL_TRADE_EVENT,
+            OrdType,
+            Side,
+            Status,
+            TimeInForce,
+        },
+    };
+
+    fn event(ev: u64, exch_ts: i64, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts,
+            local_ts: exch_ts,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    #[test]
+    fn l2_modify_leaves_cancel_new_resets_leaves_qty() {
+        let latency = ConstantLatency::new(/* entry */ 1, /* response */ 1);
+        let (order_e2l, order_l2e) = order_bus(latency);
+
+        let exch_depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        let local_depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+
+        let asset = LinearAsset::new(1.0);
+        let fees = TradingValueFeeModel::new(CommonFees::new(/* maker */ 0.0, /* taker */ 0.0));
+
+        let exch_state = State::new(asset.clone(), fees.clone());
+        let local_state = State::new(asset, fees);
+
+        let queue_model = RiskAdverseQueueModel::<HashMapMarketDepth>::new();
+        let mut exch = super::PartialFillExchange::new(exch_depth, exch_state, queue_model, order_e2l);
+        let mut local = Local::new(local_depth, local_state, /* last_trades_cap */ 0, order_l2e);
+
+        // Build a simple market: bid@99, ask@101 so our buy@100 rests.
+        exch.process(&event(EXCH_BID_DEPTH_EVENT, 0, 99.0, 10.0))
+            .unwrap();
+        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 0, 101.0, 10.0))
+            .unwrap();
+
+        // Place buy order and let it become live.
+        local
+            .submit_order(
+                1,
+                Side::Buy,
+                100.0,
+                10.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                0,
+            )
+            .unwrap();
+        exch.process_recv_order(1, None).unwrap();
+        local.process_recv_order(2, None).unwrap();
+
+        // Partially fill 5 via a sell trade at our limit price.
+        exch.process(&event(EXCH_SELL_TRADE_EVENT, 3, 100.0, 5.0))
+            .unwrap();
+        local.process_recv_order(4, None).unwrap();
+        assert_eq!(local.orders().get(&1).unwrap().leaves_qty, 5.0);
+        assert_eq!(local.orders().get(&1).unwrap().status, Status::PartiallyFilled);
+
+        // Increase qty to 6: in L2 this forces cancel+new (order.qty > prev_leaves_qty).
+        local.modify(1, 100.0, 6.0, 5).unwrap();
+        exch.process_recv_order(6, None).unwrap();
+        assert_eq!(exch.orders.borrow().get(&1).unwrap().leaves_qty, 6.0);
+        local.process_recv_order(7, None).unwrap();
+        assert_eq!(local.orders().get(&1).unwrap().leaves_qty, 6.0);
+        assert_eq!(local.orders().get(&1).unwrap().status, Status::New);
+
+        // Fully fill the replacement order and ensure total filled reflects the new qty.
+        exch.process(&event(EXCH_SELL_TRADE_EVENT, 8, 100.0, 6.0))
+            .unwrap();
+        local.process_recv_order(9, None).unwrap();
+        assert_eq!(local.state_values().position, 11.0);
+        assert_eq!(local.orders().get(&1).unwrap().status, Status::Filled);
+        assert_eq!(local.orders().get(&1).unwrap().leaves_qty, 0.0);
     }
 }

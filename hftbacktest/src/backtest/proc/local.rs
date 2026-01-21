@@ -349,3 +349,204 @@ where
             .unwrap_or(i64::MAX)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{
+                CommonFees,
+                ConstantLatency,
+                L3FIFOQueueModel,
+                RiskAdverseQueueModel,
+                TradingValueFeeModel,
+            },
+            order::order_bus,
+            proc::{
+                L3Local,
+                L3NoPartialFillExchange,
+                LocalProcessor,
+                NoPartialFillExchange,
+                PartialFillExchange,
+                Processor,
+            },
+            state::State,
+        },
+        depth::HashMapMarketDepth,
+        types::{OrdType, Side, TimeInForce},
+    };
+
+    fn make_state() -> State<LinearAsset, TradingValueFeeModel<CommonFees>> {
+        State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        )
+    }
+
+    fn make_depth() -> HashMapMarketDepth {
+        HashMapMarketDepth::new(1.0, 1.0)
+    }
+
+    #[test]
+    fn cancel_ack_preserves_request_local_timestamp_for_latency_nopartialfill_exchange() {
+        let entry_latency = 3;
+        let resp_latency = 4;
+        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = NoPartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            RiskAdverseQueueModel::new(),
+            order_e2l,
+        );
+
+        let order_id = 1;
+        let t_new = 10;
+        let t_cancel = 40;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new,
+            )
+            .unwrap();
+
+        let t_new_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_new_exch, t_new + entry_latency);
+        exch.process_recv_order(t_new_exch, None).unwrap();
+
+        let t_new_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_new_resp, t_new_exch + resp_latency);
+        local.process_recv_order(t_new_resp, None).unwrap();
+
+        local.cancel(order_id, t_cancel).unwrap();
+
+        let t_cancel_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_exch, t_cancel + entry_latency);
+        exch.process_recv_order(t_cancel_exch, None).unwrap();
+
+        let t_cancel_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_resp, t_cancel_exch + resp_latency);
+        local.process_recv_order(t_cancel_resp, None).unwrap();
+
+        assert_eq!(
+            local.order_latency(),
+            Some((t_cancel, t_cancel_exch, t_cancel_resp))
+        );
+    }
+
+    #[test]
+    fn cancel_ack_preserves_request_local_timestamp_for_latency_partialfillexchange() {
+        let entry_latency = 3;
+        let resp_latency = 4;
+        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            RiskAdverseQueueModel::new(),
+            order_e2l,
+        );
+
+        let order_id = 1;
+        let t_new = 10;
+        let t_cancel = 40;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new,
+            )
+            .unwrap();
+
+        let t_new_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_new_exch, t_new + entry_latency);
+        exch.process_recv_order(t_new_exch, None).unwrap();
+
+        let t_new_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_new_resp, t_new_exch + resp_latency);
+        local.process_recv_order(t_new_resp, None).unwrap();
+
+        local.cancel(order_id, t_cancel).unwrap();
+
+        let t_cancel_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_exch, t_cancel + entry_latency);
+        exch.process_recv_order(t_cancel_exch, None).unwrap();
+
+        let t_cancel_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_resp, t_cancel_exch + resp_latency);
+        local.process_recv_order(t_cancel_resp, None).unwrap();
+
+        assert_eq!(
+            local.order_latency(),
+            Some((t_cancel, t_cancel_exch, t_cancel_resp))
+        );
+    }
+
+    #[test]
+    fn cancel_ack_preserves_request_local_timestamp_for_latency_l3_nopartialfill_exchange() {
+        let entry_latency = 3;
+        let resp_latency = 4;
+        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3NoPartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        );
+
+        let order_id = 1;
+        let t_new = 10;
+        let t_cancel = 40;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new,
+            )
+            .unwrap();
+
+        let t_new_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_new_exch, t_new + entry_latency);
+        exch.process_recv_order(t_new_exch, None).unwrap();
+
+        let t_new_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_new_resp, t_new_exch + resp_latency);
+        local.process_recv_order(t_new_resp, None).unwrap();
+
+        local.cancel(order_id, t_cancel).unwrap();
+
+        let t_cancel_exch = exch.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_exch, t_cancel + entry_latency);
+        exch.process_recv_order(t_cancel_exch, None).unwrap();
+
+        let t_cancel_resp = local.earliest_recv_order_timestamp();
+        assert_eq!(t_cancel_resp, t_cancel_exch + resp_latency);
+        local.process_recv_order(t_cancel_resp, None).unwrap();
+
+        assert_eq!(
+            local.order_latency(),
+            Some((t_cancel, t_cancel_exch, t_cancel_resp))
+        );
+    }
+}

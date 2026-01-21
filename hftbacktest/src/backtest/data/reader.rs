@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     cell::RefCell,
     collections::HashMap,
     io::{Error as IoError, ErrorKind},
@@ -17,6 +18,7 @@ use crate::{
         BacktestError,
         data::{
             Data,
+            DataPtr,
             POD,
             npy::{NpyDTyped, read_npy_file, read_npz_file},
         },
@@ -162,47 +164,66 @@ where
     }
 }
 
-/// Directly implementing `Send` for `Data` may lead to unsafe sharing between threads. To mitigate
-/// this risk, `DataSend` is used to wrap `Data`, which implements the `Send` marker trait. This
-/// transfer ownership between threads while requiring careful consideration.
-struct DataSend<D>(Data<D>)
-where
-    D: NpyDTyped + Clone;
+// SAFETY: `DataPtr` is an owning pointer to an allocated byte slice. Transferring unique ownership
+// between threads is safe as long as it is not aliased. `DataPtr` remains !Sync, preventing shared
+// references from being used across threads without additional synchronization.
+unsafe impl Send for DataPtr {}
 
-impl<D> DataSend<D>
-where
-    D: NpyDTyped + Clone,
-{
-    pub fn unwrap(self) -> Data<D> {
-        self.0
+/// Directly implementing `Send` for `Data` may lead to unsafe sharing between threads. To mitigate
+/// this risk, `DataSend` transfers owned bytes ([`DataPtr`]) and reconstructs `Data` on the
+/// receiver thread.
+struct DataSend {
+    ptr: DataPtr,
+    offset: usize,
+}
+
+impl DataSend {
+    fn from_data<D>(data: Data<D>) -> Self
+    where
+        D: POD + Clone,
+    {
+        let Data {
+            ptr,
+            offset,
+            _d_marker: _,
+        } = data;
+
+        // `Data<D>` uses `Rc`, which is not `Send`. Convert to owned bytes for safe cross-thread
+        // transfer. If we have unique ownership, avoid a copy.
+        let ptr = match Rc::try_unwrap(ptr) {
+            Ok(ptr) => ptr,
+            Err(ptr) => {
+                let mut owned = DataPtr::new(ptr.len());
+                owned[..].copy_from_slice(&ptr[..]);
+                owned
+            }
+        };
+
+        Self { ptr, offset }
+    }
+
+    fn into_data<D>(self) -> Data<D>
+    where
+        D: POD + Clone,
+    {
+        // SAFETY: `DataSend` is created only from a valid `Data<D>` and preserves the same offset,
+        // so the memory layout and alignment match `D`.
+        unsafe { Data::from_data_ptr(self.ptr, self.offset) }
     }
 }
-unsafe impl<D> Send for DataSend<D> where D: NpyDTyped + Clone {}
 
-struct LoadDataResult<D>
-where
-    D: NpyDTyped + Clone,
-{
+struct LoadDataResult {
     key: String,
-    result: Result<DataSend<D>, IoError>,
+    result: Result<DataSend, IoError>,
 }
 
-impl<D> LoadDataResult<D>
-where
-    D: NpyDTyped + Clone,
-{
-    pub fn ok(key: String, data: Data<D>) -> Self {
-        Self {
-            key,
-            result: Ok(DataSend(data)),
-        }
+impl LoadDataResult {
+    pub fn ok(key: String, data: DataSend) -> Self {
+        Self { key, result: Ok(data) }
     }
 
     pub fn err(key: String, error: IoError) -> Self {
-        Self {
-            key,
-            result: Err(error),
-        }
+        Self { key, result: Err(error) }
     }
 }
 
@@ -322,8 +343,8 @@ where
     data_key_list: Vec<String>,
     cache: Cache<D>,
     data_num: usize,
-    tx: Sender<LoadDataResult<D>>,
-    rx: Rc<Receiver<LoadDataResult<D>>>,
+    tx: Sender<LoadDataResult>,
+    rx: Rc<Receiver<LoadDataResult>>,
     parallel_load: bool,
     preprocessor: Option<Arc<Box<dyn DataPreprocess<D> + Sync + Send + 'static>>>,
 }
@@ -357,19 +378,32 @@ where
             }
 
             while !self.cache.is_ready(&key) {
-                match self.rx.recv().unwrap() {
+                let msg = self.rx.recv().map_err(|err| {
+                    BacktestError::DataError(IoError::new(
+                        ErrorKind::Other,
+                        format!(
+                            "Loader channel closed unexpectedly while waiting for '{key}': {err}"
+                        ),
+                    ))
+                })?;
+
+                match msg {
                     LoadDataResult {
-                        key,
-                        result: Ok(data),
+                        key: loaded_key,
+                        result: Ok(data_send),
                     } => {
-                        self.cache.set(&key, data.unwrap());
+                        self.cache.set(&loaded_key, data_send.into_data::<D>());
                     }
                     LoadDataResult {
-                        result: Err(err), ..
+                        key: loaded_key,
+                        result: Err(err),
                     } => {
+                        // Ensure a subsequent call doesn't wait forever on a non-ready placeholder
+                        // if the caller chooses to retry after an error.
+                        self.cache.0.borrow_mut().remove(&loaded_key);
                         return Err(BacktestError::DataError(std::io::Error::new(
                             err.kind(),
-                            format!("Failed to read file '{key}': {err}"),
+                            format!("Failed to read file '{loaded_key}': {err}"),
                         )));
                     }
                 }
@@ -400,16 +434,24 @@ where
                         }
                         Ok(data)
                     };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        load_data(&filepath)
+                    }));
                     // SendError occurs only if Reader is already destroyed. Since no data is needed
                     // once the Reader is destroyed, SendError is safely suppressed.
-                    match load_data(&filepath) {
-                        Ok(data) => {
-                            let _ = tx.send(LoadDataResult::ok(filepath, data));
-                        }
-                        Err(err) => {
-                            let _ = tx.send(LoadDataResult::err(filepath, err));
-                        }
-                    }
+                    let result: Result<DataSend, IoError> = match result {
+                        Ok(Ok(data)) => Ok(DataSend::from_data(data)),
+                        Ok(Err(err)) => Err(err),
+                        Err(payload) => Err(IoError::new(
+                            ErrorKind::Other,
+                            format!("loader thread panicked: {}", panic_payload_to_string(&payload)),
+                        )),
+                    };
+
+                    let _ = tx.send(match result {
+                        Ok(data) => LoadDataResult::ok(filepath, data),
+                        Err(err) => LoadDataResult::err(filepath, err),
+                    });
                 });
             } else if key.ends_with(".npz") {
                 let tx = self.tx.clone();
@@ -424,16 +466,24 @@ where
                         }
                         Ok(data)
                     };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        load_data(&filepath)
+                    }));
                     // SendError occurs only if Reader is already destroyed. Since no data is needed
                     // once the Reader is destroyed, SendError is safely suppressed.
-                    match load_data(&filepath) {
-                        Ok(data) => {
-                            let _ = tx.send(LoadDataResult::ok(filepath, data));
-                        }
-                        Err(err) => {
-                            let _ = tx.send(LoadDataResult::err(filepath, err));
-                        }
-                    }
+                    let result: Result<DataSend, IoError> = match result {
+                        Ok(Ok(data)) => Ok(DataSend::from_data(data)),
+                        Ok(Err(err)) => Err(err),
+                        Err(payload) => Err(IoError::new(
+                            ErrorKind::Other,
+                            format!("loader thread panicked: {}", panic_payload_to_string(&payload)),
+                        )),
+                    };
+
+                    let _ = tx.send(match result {
+                        Ok(data) => LoadDataResult::ok(filepath, data),
+                        Err(err) => LoadDataResult::err(filepath, err),
+                    });
                 });
             } else {
                 return Err(BacktestError::DataError(IoError::new(
@@ -443,6 +493,16 @@ where
             }
         }
         Ok(())
+    }
+}
+
+fn panic_payload_to_string(payload: &Box<dyn Any + Send + 'static>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -501,6 +561,12 @@ impl DataPreprocess<Event> for FeedLatencyAdjustment {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        sync::mpsc::channel,
+        time::Duration,
+    };
+
     use std::io::ErrorKind;
 
     use super::*;
@@ -521,5 +587,64 @@ mod tests {
 
         let err = adjustment.preprocess(&mut data).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn next_data_returns_error_if_loader_panics_instead_of_hanging() {
+        struct PanicPreprocessor;
+
+        impl DataPreprocess<Event> for PanicPreprocessor {
+            fn preprocess(&self, _data: &mut Data<Event>) -> Result<(), IoError> {
+                panic!("intentional panic in loader thread");
+            }
+        }
+
+        let filepath = std::env::temp_dir().join(format!(
+            "hftbacktest_reader_panic_{}.npy",
+            Uuid::new_v4()
+        ));
+        let mut file = File::create(&filepath).unwrap();
+
+        crate::backtest::data::write_npy(
+            &mut file,
+            &[Event {
+                ev: 0,
+                exch_ts: 1,
+                local_ts: 2,
+                px: 0.0,
+                qty: 0.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            }],
+        )
+        .unwrap();
+
+        let filepath_str = filepath.to_string_lossy().to_string();
+        let (tx, rx) = channel();
+        let handle = thread::spawn(move || {
+            let mut reader = Reader::<Event>::builder()
+                .parallel_load(false)
+                .preprocessor(PanicPreprocessor)
+                .data(vec![DataSource::File(filepath_str)])
+                .build()
+                .unwrap();
+
+            let res = match reader.next_data() {
+                Ok(_) => Ok(()),
+                Err(BacktestError::DataError(err)) => Err(err.kind()),
+                Err(_) => Err(ErrorKind::Other),
+            };
+            let _ = tx.send(res);
+        });
+
+        let res = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Reader::next_data() hung instead of returning an error");
+
+        let _ = handle.join();
+        let _ = std::fs::remove_file(filepath);
+
+        assert_eq!(res, Err(ErrorKind::Other));
     }
 }

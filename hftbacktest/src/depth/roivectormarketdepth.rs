@@ -36,9 +36,22 @@ pub struct ROIVectorMarketDepth {
 
 #[inline(always)]
 fn depth_below(depth: &[f64], start: i64, end: i64, roi_lb: i64, roi_ub: i64) -> i64 {
-    let start = (start.min(roi_ub) - roi_lb) as usize;
-    let end = (end.max(roi_lb) - roi_lb) as usize;
-    for t in (end..start).rev() {
+    if roi_lb > roi_ub {
+        return INVALID_MIN;
+    }
+    if depth.is_empty() {
+        return INVALID_MIN;
+    }
+
+    let start_tick = start.clamp(roi_lb, roi_ub);
+    let end_tick = end.clamp(roi_lb, roi_ub);
+    if end_tick >= start_tick {
+        return INVALID_MIN;
+    }
+
+    let start_idx = (start_tick - roi_lb) as usize;
+    let end_idx = (end_tick - roi_lb) as usize;
+    for t in (end_idx..start_idx).rev() {
         if unsafe { *depth.get_unchecked(t) } > 0f64 {
             return t as i64 + roi_lb;
         }
@@ -48,9 +61,22 @@ fn depth_below(depth: &[f64], start: i64, end: i64, roi_lb: i64, roi_ub: i64) ->
 
 #[inline(always)]
 fn depth_above(depth: &[f64], start: i64, end: i64, roi_lb: i64, roi_ub: i64) -> i64 {
-    let start = (start.max(roi_lb) - roi_lb) as usize;
-    let end = (end.min(roi_ub) - roi_lb) as usize;
-    for t in (start + 1)..(end + 1) {
+    if roi_lb > roi_ub {
+        return INVALID_MAX;
+    }
+    if depth.is_empty() {
+        return INVALID_MAX;
+    }
+
+    let start_tick = start.clamp(roi_lb, roi_ub);
+    let end_tick = end.clamp(roi_lb, roi_ub);
+    if start_tick >= end_tick {
+        return INVALID_MAX;
+    }
+
+    let start_idx = (start_tick - roi_lb) as usize;
+    let end_idx = (end_tick - roi_lb) as usize;
+    for t in (start_idx + 1)..=end_idx {
         if unsafe { *depth.get_unchecked(t) } > 0f64 {
             return t as i64 + roi_lb;
         }
@@ -283,8 +309,15 @@ impl L2MarketDepth for ROIVectorMarketDepth {
                 if clear_upto_price.is_finite() {
                     let clear_upto = (clear_upto_price / self.tick_size).round() as i64;
                     if self.best_bid_tick != INVALID_MIN {
-                        let from = (clear_upto - self.roi_lb).max(0);
-                        let to = self.best_bid_tick + 1 - self.roi_lb;
+                        let len = self.bid_depth.len() as i64;
+                        let from = clear_upto
+                            .saturating_sub(self.roi_lb)
+                            .clamp(0, len);
+                        let to = self
+                            .best_bid_tick
+                            .saturating_add(1)
+                            .saturating_sub(self.roi_lb)
+                            .clamp(0, len);
                         for t in from..to {
                             unsafe {
                                 *self.bid_depth.get_unchecked_mut(t as usize) = 0.0;
@@ -324,8 +357,14 @@ impl L2MarketDepth for ROIVectorMarketDepth {
                 if clear_upto_price.is_finite() {
                     let clear_upto = (clear_upto_price / self.tick_size).round() as i64;
                     if self.best_ask_tick != INVALID_MAX {
-                        let from = self.best_ask_tick - self.roi_lb;
-                        let to = (clear_upto + 1 - self.roi_lb).min(self.ask_depth.len() as i64);
+                        let len = self.ask_depth.len() as i64;
+                        let from = self.best_ask_tick
+                            .saturating_sub(self.roi_lb)
+                            .clamp(0, len);
+                        let to = clear_upto
+                            .saturating_add(1)
+                            .saturating_sub(self.roi_lb)
+                            .clamp(0, len);
                         for t in from..to {
                             unsafe {
                                 *self.ask_depth.get_unchecked_mut(t as usize) = 0.0;
@@ -955,6 +994,23 @@ mod tests {
 
         depth.clear_depth(Side::Buy, 11.0);
         assert_eq!(depth.best_bid_tick(), 10);
+    }
+
+    #[test]
+    fn test_recompute_depth_above_clamps_into_roi_and_returns_invalid_max() {
+        let mut depth = ROIVectorMarketDepth::new(1.0, 1.0, -1.0, 1.0);
+        depth.update_ask_depth(0.0, 1.0, 0);
+
+        let _ = depth.add_buy_order(1, f64::MAX, 1.0, 0).unwrap();
+        assert_eq!(depth.best_ask_tick(), INVALID_MAX);
+    }
+
+    #[test]
+    fn test_recompute_depth_below_clamps_into_roi_and_returns_invalid_min() {
+        let mut depth = ROIVectorMarketDepth::new(1.0, 1.0, 1.0, 2.0);
+
+        let _ = depth.add_sell_order(1, -f64::MAX, 1.0, 0).unwrap();
+        assert_eq!(depth.best_bid_tick(), INVALID_MIN);
     }
 
     #[test]

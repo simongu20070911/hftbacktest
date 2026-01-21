@@ -278,6 +278,7 @@ where
     }
 
     fn ack_cancel(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
+        let req_local_timestamp = order.local_timestamp;
         match self
             .queue_model
             .cancel_backtest_order(order.order_id, &self.depth)
@@ -285,6 +286,7 @@ where
             Ok(exch_order) => {
                 let _ = std::mem::replace(order, exch_order);
 
+                order.local_timestamp = req_local_timestamp;
                 order.status = Status::Canceled;
                 order.exch_timestamp = timestamp;
                 Ok(())
