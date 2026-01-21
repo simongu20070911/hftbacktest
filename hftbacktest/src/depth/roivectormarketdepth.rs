@@ -4,7 +4,14 @@ use super::{ApplySnapshot, INVALID_MAX, INVALID_MIN, L3MarketDepth, L3Order, Mar
 use crate::{
     backtest::{BacktestError, data::Data},
     prelude::{L2MarketDepth, OrderId, Side},
-    types::{BUY_EVENT, Event, SELL_EVENT},
+    types::{
+        BUY_EVENT,
+        DEPTH_SNAPSHOT_EVENT,
+        EXCH_EVENT,
+        Event,
+        LOCAL_EVENT,
+        SELL_EVENT,
+    },
 };
 
 /// L2/L3 market depth implementation based on a vector within the range of interest.
@@ -416,7 +423,7 @@ impl MarketDepth for ROIVectorMarketDepth {
     fn best_ask_qty(&self) -> f64 {
         if self.best_ask_tick < self.roi_lb || self.best_ask_tick > self.roi_ub {
             // This is outside the range of interest.
-            f64::NAN
+            0.0
         } else {
             unsafe {
                 *self
@@ -440,7 +447,7 @@ impl MarketDepth for ROIVectorMarketDepth {
     fn bid_qty_at_tick(&self, price_tick: i64) -> f64 {
         if price_tick < self.roi_lb || price_tick > self.roi_ub {
             // This is outside the range of interest.
-            f64::NAN
+            0.0
         } else {
             unsafe {
                 *self
@@ -454,7 +461,7 @@ impl MarketDepth for ROIVectorMarketDepth {
     fn ask_qty_at_tick(&self, price_tick: i64) -> f64 {
         if price_tick < self.roi_lb || price_tick > self.roi_ub {
             // This is outside the range of interest.
-            f64::NAN
+            0.0
         } else {
             unsafe {
                 *self
@@ -504,7 +511,57 @@ impl ApplySnapshot for ROIVectorMarketDepth {
     }
 
     fn snapshot(&self) -> Vec<Event> {
-        unimplemented!();
+        let mut events = Vec::new();
+
+        if self.best_bid_tick != INVALID_MIN && self.low_bid_tick != INVALID_MAX {
+            let start_tick = self.best_bid_tick.min(self.roi_ub);
+            let end_tick = self.low_bid_tick.max(self.roi_lb);
+            if end_tick <= start_tick {
+                for px_tick in (end_tick..=start_tick).rev() {
+                    let t = (px_tick - self.roi_lb) as usize;
+                    let qty = unsafe { *self.bid_depth.get_unchecked(t) };
+                    if (qty / self.lot_size).round() as i64 == 0 {
+                        continue;
+                    }
+                    events.push(Event {
+                        ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                        exch_ts: 0,
+                        local_ts: 0,
+                        px: px_tick as f64 * self.tick_size,
+                        qty,
+                        order_id: 0,
+                        ival: 0,
+                        fval: 0.0,
+                    });
+                }
+            }
+        }
+
+        if self.best_ask_tick != INVALID_MAX && self.high_ask_tick != INVALID_MIN {
+            let start_tick = self.best_ask_tick.max(self.roi_lb);
+            let end_tick = self.high_ask_tick.min(self.roi_ub);
+            if start_tick <= end_tick {
+                for px_tick in start_tick..=end_tick {
+                    let t = (px_tick - self.roi_lb) as usize;
+                    let qty = unsafe { *self.ask_depth.get_unchecked(t) };
+                    if (qty / self.lot_size).round() as i64 == 0 {
+                        continue;
+                    }
+                    events.push(Event {
+                        ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                        exch_ts: 0,
+                        local_ts: 0,
+                        px: px_tick as f64 * self.tick_size,
+                        qty,
+                        order_id: 0,
+                        ival: 0,
+                        fval: 0.0,
+                    });
+                }
+            }
+        }
+
+        events
     }
 }
 
@@ -809,8 +866,18 @@ impl L3MarketDepth for ROIVectorMarketDepth {
 #[cfg(test)]
 mod tests {
     use crate::{
-        depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, L3MarketDepth, MarketDepth, ROIVectorMarketDepth},
-        types::Side,
+        backtest::data::Data,
+        backtest::models::{QueueModel, RiskAdverseQueueModel},
+        depth::{
+            ApplySnapshot,
+            INVALID_MAX,
+            INVALID_MIN,
+            L2MarketDepth,
+            L3MarketDepth,
+            MarketDepth,
+            ROIVectorMarketDepth,
+        },
+        types::{BUY_EVENT, DEPTH_SNAPSHOT_EVENT, EXCH_EVENT, Event, LOCAL_EVENT, OrdType, Order, SELL_EVENT, Side, TimeInForce},
     };
 
     macro_rules! assert_eq_qty {
@@ -820,6 +887,49 @@ mod tests {
                 ($b / $lot_size).round() as i64
             );
         }};
+    }
+
+    #[test]
+    fn test_out_of_roi_qty_queries_return_zero_instead_of_nan() {
+        let depth = ROIVectorMarketDepth::new(1.0, 1.0, 0.0, 10.0);
+
+        let bid_qty = depth.bid_qty_at_tick(-1);
+        assert_eq!(bid_qty, 0.0);
+        assert!(bid_qty.is_finite());
+
+        let ask_qty = depth.ask_qty_at_tick(11);
+        assert_eq!(ask_qty, 0.0);
+        assert!(ask_qty.is_finite());
+    }
+
+    #[test]
+    fn test_best_ask_qty_is_zero_when_no_best_ask() {
+        let depth = ROIVectorMarketDepth::new(1.0, 1.0, 0.0, 10.0);
+
+        let best_ask_qty = depth.best_ask_qty();
+        assert_eq!(best_ask_qty, 0.0);
+        assert!(best_ask_qty.is_finite());
+    }
+
+    #[test]
+    fn test_queue_model_new_order_out_of_roi_does_not_nan_poison() {
+        let depth = ROIVectorMarketDepth::new(1.0, 1.0, 0.0, 10.0);
+        let queue_model = RiskAdverseQueueModel::<ROIVectorMarketDepth>::new();
+
+        let mut order = Order::new(
+            1,
+            50,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        queue_model.new_order(&mut order, &depth);
+
+        let front_q_qty = order.q.as_any().downcast_ref::<f64>().unwrap();
+        assert_eq!(*front_q_qty, 0.0);
+        assert!(front_q_qty.is_finite());
     }
 
     #[test]
@@ -1057,5 +1167,71 @@ mod tests {
         assert_eq!(depth.best_ask_tick(), 5001);
         assert_eq_qty!(depth.ask_qty_at_tick(4981), 0.0, lot_size);
         assert_eq_qty!(depth.ask_qty_at_tick(5002), 0.002, lot_size);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_bbo_and_qty() {
+        let tick_size = 1.0;
+        let lot_size = 0.01;
+        let roi_lb = 90.0;
+        let roi_ub = 110.0;
+        let snapshot = vec![
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 99.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 98.0,
+                qty: 2.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 1.5,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 102.0,
+                qty: 3.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ];
+
+        let data = Data::from_data(&snapshot);
+        let mut depth = ROIVectorMarketDepth::new(tick_size, lot_size, roi_lb, roi_ub);
+        depth.apply_snapshot(&data);
+
+        let snapshot = depth.snapshot();
+        let data = Data::from_data(&snapshot);
+        let mut round_tripped = ROIVectorMarketDepth::new(tick_size, lot_size, roi_lb, roi_ub);
+        round_tripped.apply_snapshot(&data);
+
+        assert_eq!(round_tripped.best_bid_tick(), depth.best_bid_tick());
+        assert_eq!(round_tripped.best_ask_tick(), depth.best_ask_tick());
+        assert_eq_qty!(round_tripped.bid_qty_at_tick(99), depth.bid_qty_at_tick(99), lot_size);
+        assert_eq_qty!(round_tripped.bid_qty_at_tick(98), depth.bid_qty_at_tick(98), lot_size);
+        assert_eq_qty!(round_tripped.ask_qty_at_tick(101), depth.ask_qty_at_tick(101), lot_size);
+        assert_eq_qty!(round_tripped.ask_qty_at_tick(102), depth.ask_qty_at_tick(102), lot_size);
     }
 }

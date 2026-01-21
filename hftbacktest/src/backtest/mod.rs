@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::Error as IoError,
+    io::{Error as IoError, ErrorKind},
     ops::{Deref, DerefMut},
 };
 
@@ -19,7 +19,7 @@ use crate::{
         data::{Data, FeedLatencyAdjustment, NpyDTyped},
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
-        order::order_bus,
+        order::{order_bus, order_bus_with_max_timestamp_reordering},
         proc::{Local, LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor},
         state::State,
     },
@@ -137,6 +137,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     data: Vec<DataSource<Event>>,
     parallel_load: bool,
     latency_offset: i64,
+    order_bus_max_timestamp_reordering: i64,
     fee_model: Option<FM>,
     exch_kind: ExchangeKind,
     last_trades_cap: usize,
@@ -160,6 +161,7 @@ where
             data: vec![],
             parallel_load: false,
             latency_offset: 0,
+            order_bus_max_timestamp_reordering: 0,
             fee_model: None,
             exch_kind: ExchangeKind::NoPartialFillExchange,
             last_trades_cap: 0,
@@ -189,6 +191,17 @@ where
     pub fn latency_offset(self, latency_offset: i64) -> Self {
         Self {
             latency_offset,
+            ..self
+        }
+    }
+
+    /// Sets the maximum timestamp reordering window for the internal order buses.
+    ///
+    /// A value of `0` keeps the strict FIFO/clamp behavior (default). A positive value allows
+    /// order requests/responses to be reordered by timestamp within the specified window.
+    pub fn order_bus_max_timestamp_reordering(self, max_timestamp_reordering: i64) -> Self {
+        Self {
+            order_bus_max_timestamp_reordering: max_timestamp_reordering.max(0),
             ..self
         }
     }
@@ -284,7 +297,14 @@ where
             .clone()
             .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
 
-        let (order_e2l, order_l2e) = order_bus(order_latency);
+        let (order_e2l, order_l2e) = if self.order_bus_max_timestamp_reordering > 0 {
+            order_bus_with_max_timestamp_reordering(
+                order_latency,
+                self.order_bus_max_timestamp_reordering,
+            )
+        } else {
+            order_bus(order_latency)
+        };
 
         let local = Local::new(
             create_depth(),
@@ -358,6 +378,7 @@ pub struct L3AssetBuilder<LM, AT, QM, MD, FM> {
     data: Vec<DataSource<Event>>,
     parallel_load: bool,
     latency_offset: i64,
+    order_bus_max_timestamp_reordering: i64,
     fee_model: Option<FM>,
     exch_kind: ExchangeKind,
     last_trades_cap: usize,
@@ -382,6 +403,7 @@ where
             data: vec![],
             parallel_load: false,
             latency_offset: 0,
+            order_bus_max_timestamp_reordering: 0,
             fee_model: None,
             exch_kind: ExchangeKind::NoPartialFillExchange,
             last_trades_cap: 0,
@@ -411,6 +433,17 @@ where
     pub fn latency_offset(self, latency_offset: i64) -> Self {
         Self {
             latency_offset,
+            ..self
+        }
+    }
+
+    /// Sets the maximum timestamp reordering window for the internal order buses.
+    ///
+    /// A value of `0` keeps the strict FIFO/clamp behavior (default). A positive value allows
+    /// order requests/responses to be reordered by timestamp within the specified window.
+    pub fn order_bus_max_timestamp_reordering(self, max_timestamp_reordering: i64) -> Self {
+        Self {
+            order_bus_max_timestamp_reordering: max_timestamp_reordering.max(0),
             ..self
         }
     }
@@ -506,7 +539,14 @@ where
             .clone()
             .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
 
-        let (order_e2l, order_l2e) = order_bus(order_latency);
+        let (order_e2l, order_l2e) = if self.order_bus_max_timestamp_reordering > 0 {
+            order_bus_with_max_timestamp_reordering(
+                order_latency,
+                self.order_bus_max_timestamp_reordering,
+            )
+        } else {
+            order_bus(order_latency)
+        };
 
         let local = L3Local::new(
             create_depth(),
@@ -658,6 +698,12 @@ impl<P: Processor> BacktestProcessorState<P> {
 
             for rn in start..self.data.len() {
                 if let Some(ts) = self.processor.event_seen_timestamp(&self.data[rn]) {
+                    if ts == i64::MAX {
+                        return Err(BacktestError::DataError(IoError::new(
+                            ErrorKind::InvalidData,
+                            "timestamp `i64::MAX` is reserved for `UNTIL_END_OF_DATA`",
+                        )));
+                    }
                     self.row = Some(rn);
                     return Ok(ts);
                 }
@@ -759,6 +805,7 @@ where
     ) -> Result<ElapseResult, BacktestError> {
         let mut result = ElapseResult::Ok;
         let mut timestamp = timestamp;
+        let mut last_event_timestamp: Option<i64> = None;
         for (asset_no, local) in self.local.iter().enumerate() {
             self.evs
                 .update_exch_order(asset_no, local.earliest_send_order_timestamp());
@@ -772,6 +819,7 @@ where
                         self.cur_ts = timestamp;
                         return Ok(result);
                     }
+                    last_event_timestamp = Some(ev.timestamp);
                     match ev.kind {
                         EventIntentKind::LocalData => {
                             let local = unsafe { self.local.get_unchecked_mut(ev.asset_no) };
@@ -856,6 +904,9 @@ where
                     }
                 }
                 None => {
+                    if let Some(last_event_timestamp) = last_event_timestamp {
+                        self.cur_ts = last_event_timestamp;
+                    }
                     return Ok(ElapseResult::EndOfData);
                 }
             }
@@ -1072,8 +1123,25 @@ where
         order_id: OrderId,
         timeout: i64,
     ) -> Result<ElapseResult, BacktestError> {
+        if timeout < 0 {
+            return Err(BacktestError::DataError(IoError::new(
+                ErrorKind::InvalidInput,
+                "`timeout` must be non-negative",
+            )));
+        }
+        if self.cur_ts == i64::MAX {
+            self.initialize_evs()?;
+            match self.evs.next() {
+                Some(ev) => {
+                    self.cur_ts = ev.timestamp;
+                }
+                None => {
+                    return Ok(ElapseResult::EndOfData);
+                }
+            }
+        }
         self.goto::<false>(
-            self.cur_ts + timeout,
+            self.cur_ts.checked_add(timeout).unwrap_or(UNTIL_END_OF_DATA),
             WaitOrderResponse::Specified { asset_no, order_id },
         )
     }
@@ -1084,6 +1152,12 @@ where
         include_order_resp: bool,
         timeout: i64,
     ) -> Result<ElapseResult, Self::Error> {
+        if timeout < 0 {
+            return Err(BacktestError::DataError(IoError::new(
+                ErrorKind::InvalidInput,
+                "`timeout` must be non-negative",
+            )));
+        }
         if self.cur_ts == i64::MAX {
             self.initialize_evs()?;
             match self.evs.next() {
@@ -1095,15 +1169,22 @@ where
                 }
             }
         }
+        let target = self.cur_ts.checked_add(timeout).unwrap_or(UNTIL_END_OF_DATA);
         if include_order_resp {
-            self.goto::<true>(self.cur_ts + timeout, WaitOrderResponse::Any)
+            self.goto::<true>(target, WaitOrderResponse::Any)
         } else {
-            self.goto::<true>(self.cur_ts + timeout, WaitOrderResponse::None)
+            self.goto::<true>(target, WaitOrderResponse::None)
         }
     }
 
     #[inline]
     fn elapse(&mut self, duration: i64) -> Result<ElapseResult, Self::Error> {
+        if duration < 0 {
+            return Err(BacktestError::DataError(IoError::new(
+                ErrorKind::InvalidInput,
+                "`duration` must be non-negative",
+            )));
+        }
         if self.cur_ts == i64::MAX {
             self.initialize_evs()?;
             match self.evs.next() {
@@ -1115,7 +1196,10 @@ where
                 }
             }
         }
-        self.goto::<false>(self.cur_ts + duration, WaitOrderResponse::None)
+        self.goto::<false>(
+            self.cur_ts.checked_add(duration).unwrap_or(UNTIL_END_OF_DATA),
+            WaitOrderResponse::None,
+        )
     }
 
     #[inline]
@@ -1142,10 +1226,13 @@ where
 #[cfg(test)]
 mod test {
     use std::error::Error;
+    use std::io::ErrorKind;
 
+    use super::evs::{EventIntentKind, EventSet};
     use crate::{
         backtest::{
             Backtest,
+            BacktestError,
             DataSource,
             ExchangeKind::NoPartialFillExchange,
             ExchangeKind::PartialFillExchange,
@@ -1164,7 +1251,16 @@ mod test {
         },
         depth::HashMapMarketDepth,
         prelude::{Bot, Event},
-        types::{EXCH_ASK_DEPTH_SNAPSHOT_EVENT, EXCH_EVENT, LOCAL_EVENT, OrdType, Order, Status, TimeInForce},
+        types::{
+            ElapseResult,
+            EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+            EXCH_EVENT,
+            LOCAL_EVENT,
+            OrdType,
+            Order,
+            Status,
+            TimeInForce,
+        },
     };
 
     #[derive(Clone)]
@@ -1361,6 +1457,361 @@ mod test {
         let order = backtester.orders(0).get(&1).unwrap();
         assert_eq!(10, order.price_tick);
         assert_eq!(1.0, order.qty);
+        Ok(())
+    }
+
+    #[test]
+    fn goto_end_advances_timestamp_and_flushes_pending_order_responses() -> Result<(), Box<dyn Error>>
+    {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 10))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let _ = backtester.elapse_bt(0)?;
+
+        backtester.submit_buy_order(0, 1, 100.0, 1.0, TimeInForce::IOC, OrdType::Limit, false)?;
+
+        let result = backtester.goto_end()?;
+        assert_eq!(ElapseResult::EndOfData, result);
+
+        assert_eq!(1.0, backtester.position(0));
+
+        assert_eq!(10, backtester.current_timestamp());
+        Ok(())
+    }
+
+    #[test]
+    fn l2_partialfillexchange_rejects_second_order_at_same_tick_and_prevents_overfill(
+    ) -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[
+            Event {
+                ev: EXCH_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 0.0,
+                qty: 0.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: crate::types::EXCH_BUY_TRADE_EVENT,
+                exch_ts: 1,
+                local_ts: 0,
+                px: 100.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let _ = backtester.elapse_bt(0)?;
+
+        backtester.submit_sell_order(
+            0,
+            1,
+            100.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+        backtester.submit_sell_order(
+            0,
+            2,
+            100.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        backtester.elapse_bt(1)?;
+
+        assert_eq!(-1.0, backtester.state_values(0).position);
+
+        let order_2 = backtester.orders(0).get(&2).unwrap();
+        assert_eq!(Status::Expired, order_2.status);
+
+        Ok(())
+    }
+
+    #[test]
+    fn l2_partialfillexchange_rejects_modify_to_existing_tick_without_canceling_original(
+    ) -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let _ = backtester.elapse_bt(0)?;
+
+        backtester.submit_sell_order(
+            0,
+            1,
+            101.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+        backtester.submit_sell_order(
+            0,
+            2,
+            102.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        backtester.modify(0, 1, 102.0, 1.0, true)?;
+
+        let order_1 = backtester.orders(0).get(&1).unwrap();
+        assert_eq!(101, order_1.price_tick);
+        assert_eq!(Status::New, order_1.status);
+
+        let order_2 = backtester.orders(0).get(&2).unwrap();
+        assert_eq!(102, order_2.price_tick);
+        assert_eq!(Status::New, order_2.status);
+
+        Ok(())
+    }
+
+    #[test]
+    fn eventset_tie_breaks_exch_order_before_exch_data() {
+        let mut evs = EventSet::new(1);
+        evs.update_exch_data(0, 1);
+        evs.update_exch_order(0, 1);
+
+        let ev = evs.next().expect("expected an event");
+        assert_eq!(ev.timestamp, 1);
+        assert_eq!(ev.asset_no, 0);
+        assert!(matches!(ev.kind, EventIntentKind::ExchOrder));
+    }
+
+    #[test]
+    fn exch_order_is_processed_before_exch_data_at_same_timestamp() -> Result<(), Box<dyn Error>> {
+        // If exchange market data (book update) is processed before an order receipt event at the
+        // same exchange timestamp, order acceptance/fills can read a post-update book state at that
+        // timestamp (within-timestamp look-ahead). This regression test asserts a conservative
+        // ordering: ExchOrder precedes ExchData when timestamps are equal.
+        let data = Data::from_data(&[
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 1,
+                local_ts: 1,
+                px: 99.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    // Order sent at local_ts=0 arrives at exch_ts=1.
+                    .latency_model(ConstantLatency::new(1, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        // Seed exchange depth at exch_ts=0 with best ask=101.
+        backtester.elapse_bt(0)?;
+
+        // A buy at 100 should not see the post-update best ask=99 when it reaches the exchange at
+        // exch_ts=1. With the conservative ordering, it becomes maker (resting) first, then gets
+        // filled as the book moves through it (exec at 100 as maker).
+        backtester.submit_buy_order(
+            0,
+            1,
+            100.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        let order = backtester.orders(0).get(&1).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert!(order.maker, "expected maker fill (no same-ts look-ahead)");
+        assert_eq!(order.exec_price_tick, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn elapse_rejects_negative_duration() -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let err = backtester.elapse_bt(-1).unwrap_err();
+        match err {
+            BacktestError::DataError(io_err) => assert_eq!(io_err.kind(), ErrorKind::InvalidInput),
+            _ => panic!("expected invalid input error, got: {err:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn elapse_does_not_overflow_target_timestamp() -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_EVENT,
+            exch_ts: i64::MAX - 1,
+            local_ts: i64::MAX - 1,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let result = backtester.elapse_bt(10)?;
+        assert_eq!(result, ElapseResult::EndOfData);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_reserved_i64_max_event_timestamp() -> Result<(), Box<dyn Error>> {
+        let data = Data::from_data(&[Event {
+            ev: EXCH_EVENT,
+            exch_ts: i64::MAX,
+            local_ts: i64::MAX,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        let err = backtester.elapse_bt(0).unwrap_err();
+        match err {
+            BacktestError::DataError(io_err) => assert_eq!(io_err.kind(), ErrorKind::InvalidData),
+            _ => panic!("expected invalid data error, got: {err:?}"),
+        }
         Ok(())
     }
 }

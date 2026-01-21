@@ -75,6 +75,12 @@ use crate::{
 /// results.
 /// (more comment will be added...)
 ///
+/// **Limitations**
+///
+/// In L2 mode, at most one active backtest order per (side, price tick) is supported; additional
+/// orders (or modifies) that would collide are rejected. Use an L3 exchange/queue model if you
+/// need multiple orders at the same price level.
+///
 pub struct PartialFillExchange<AT, LM, QM, MD, FM>
 where
     AT: AssetType,
@@ -478,6 +484,16 @@ where
                     } else {
                         match order.time_in_force {
                             TimeInForce::GTC | TimeInForce::GTX => {
+                                if self
+                                    .buy_orders
+                                    .get(&order.price_tick)
+                                    .is_some_and(|order_ids| !order_ids.is_empty())
+                                {
+                                    order.req = Status::Rejected;
+                                    order.status = Status::Expired;
+                                    order.exch_timestamp = timestamp;
+                                    return Ok(());
+                                }
                                 // Initializes the order's queue position.
                                 self.queue_model.new_order(order, &self.depth);
                                 order.status = Status::New;
@@ -608,6 +624,16 @@ where
                     } else {
                         match order.time_in_force {
                             TimeInForce::GTC | TimeInForce::GTX => {
+                                if self
+                                    .sell_orders
+                                    .get(&order.price_tick)
+                                    .is_some_and(|order_ids| !order_ids.is_empty())
+                                {
+                                    order.req = Status::Rejected;
+                                    order.status = Status::Expired;
+                                    order.exch_timestamp = timestamp;
+                                    return Ok(());
+                                }
                                 // Initializes the order's queue position.
                                 self.queue_model.new_order(order, &self.depth);
                                 order.status = Status::New;
@@ -691,9 +717,9 @@ where
         order: &mut Order,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        let (prev_order_price_tick, prev_leaves_qty) = {
+        let (exch_order, prev_order_price_tick, prev_leaves_qty) = {
             let order_borrowed = self.orders.borrow();
-            let exch_order = order_borrowed.get(&order.order_id);
+            let exch_order = order_borrowed.get(&order.order_id).cloned();
 
             // The order can be already deleted due to fill or expiration.
             if exch_order.is_none() {
@@ -703,12 +729,39 @@ where
             }
 
             let exch_order = exch_order.unwrap();
-            (exch_order.price_tick, exch_order.leaves_qty)
+            let prev_order_price_tick = exch_order.price_tick;
+            let prev_leaves_qty = exch_order.leaves_qty;
+            (exch_order, prev_order_price_tick, prev_leaves_qty)
         };
 
         // The initialization of the order queue position may not occur when the modified quantity
         // is smaller than the previous quantity, depending on the exchanges. It may need to
         // implement exchange-specific specialization.
+        if prev_order_price_tick != order.price_tick {
+            let conflicting_order_at_tick = match order.side {
+                Side::Buy => self
+                    .buy_orders
+                    .get(&order.price_tick)
+                    .is_some_and(|order_ids| {
+                        order_ids.iter().any(|order_id| *order_id != order.order_id)
+                    }),
+                Side::Sell => self
+                    .sell_orders
+                    .get(&order.price_tick)
+                    .is_some_and(|order_ids| {
+                        order_ids.iter().any(|order_id| *order_id != order.order_id)
+                    }),
+                Side::None | Side::Unsupported => false,
+            };
+            if conflicting_order_at_tick {
+                let local_timestamp = order.local_timestamp;
+                *order = exch_order;
+                order.req = Status::Rejected;
+                order.local_timestamp = local_timestamp;
+                order.exch_timestamp = timestamp;
+                return Ok(());
+            }
+        }
         if RESET_QUEUE_POS
             || prev_order_price_tick != order.price_tick
             || order.qty > prev_leaves_qty

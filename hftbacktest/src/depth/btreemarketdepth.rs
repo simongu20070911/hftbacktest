@@ -12,7 +12,14 @@ use super::{
 use crate::{
     backtest::{BacktestError, data::Data},
     prelude::{OrderId, Side},
-    types::{BUY_EVENT, Event, SELL_EVENT},
+    types::{
+        BUY_EVENT,
+        DEPTH_SNAPSHOT_EVENT,
+        EXCH_EVENT,
+        Event,
+        LOCAL_EVENT,
+        SELL_EVENT,
+    },
 };
 
 /// L2 Market depth implementation based on a B-Tree map.
@@ -241,7 +248,43 @@ impl ApplySnapshot for BTreeMarketDepth {
     }
 
     fn snapshot(&self) -> Vec<Event> {
-        todo!()
+        let mut events = Vec::new();
+
+        for (&px_tick, &qty) in self.bid_depth.iter().rev() {
+            if (qty / self.lot_size).round() as i64 == 0 {
+                continue;
+            }
+            events.push(Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                // todo: it's not a problem now, but it would be better to have valid timestamps.
+                exch_ts: 0,
+                local_ts: 0,
+                px: px_tick as f64 * self.tick_size,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            });
+        }
+
+        for (&px_tick, &qty) in &self.ask_depth {
+            if (qty / self.lot_size).round() as i64 == 0 {
+                continue;
+            }
+            events.push(Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                // todo: it's not a problem now, but it would be better to have valid timestamps.
+                exch_ts: 0,
+                local_ts: 0,
+                px: px_tick as f64 * self.tick_size,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            });
+        }
+
+        events
     }
 }
 
@@ -444,8 +487,17 @@ impl L3MarketDepth for BTreeMarketDepth {
 #[cfg(test)]
 mod tests {
     use crate::{
-        depth::{BTreeMarketDepth, INVALID_MAX, INVALID_MIN, L2MarketDepth, L3MarketDepth, MarketDepth},
-        types::Side,
+        backtest::data::Data,
+        depth::{
+            ApplySnapshot,
+            BTreeMarketDepth,
+            INVALID_MAX,
+            INVALID_MIN,
+            L2MarketDepth,
+            L3MarketDepth,
+            MarketDepth,
+        },
+        types::{BUY_EVENT, DEPTH_SNAPSHOT_EVENT, EXCH_EVENT, Event, LOCAL_EVENT, SELL_EVENT, Side},
     };
 
     macro_rules! assert_eq_qty {
@@ -726,5 +778,69 @@ mod tests {
         assert_eq!(prev_best, 5005);
         assert_eq!(best, 5003);
         assert_eq!(depth.best_bid_tick(), 5003);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_bbo_and_qty() {
+        let tick_size = 1.0;
+        let lot_size = 0.01;
+        let snapshot = vec![
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 99.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 98.0,
+                qty: 2.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 1.5,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 102.0,
+                qty: 3.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ];
+
+        let data = Data::from_data(&snapshot);
+        let mut depth = BTreeMarketDepth::new(tick_size, lot_size);
+        depth.apply_snapshot(&data);
+
+        let snapshot = depth.snapshot();
+        let data = Data::from_data(&snapshot);
+        let mut round_tripped = BTreeMarketDepth::new(tick_size, lot_size);
+        round_tripped.apply_snapshot(&data);
+
+        assert_eq!(round_tripped.best_bid_tick(), depth.best_bid_tick());
+        assert_eq!(round_tripped.best_ask_tick(), depth.best_ask_tick());
+        assert_eq_qty!(round_tripped.bid_qty_at_tick(99), depth.bid_qty_at_tick(99), lot_size);
+        assert_eq_qty!(round_tripped.bid_qty_at_tick(98), depth.bid_qty_at_tick(98), lot_size);
+        assert_eq_qty!(round_tripped.ask_qty_at_tick(101), depth.ask_qty_at_tick(101), lot_size);
+        assert_eq_qty!(round_tripped.ask_qty_at_tick(102), depth.ask_qty_at_tick(102), lot_size);
     }
 }

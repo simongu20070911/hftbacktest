@@ -17,8 +17,10 @@ pub struct EventIntent {
 pub enum EventIntentKind {
     LocalData = 0,
     LocalOrder = 1,
-    ExchData = 2,
-    ExchOrder = 3,
+    /// Exchange order receipt/response events are processed before exchange market data events when
+    /// timestamps are equal, to avoid within-timestamp look-ahead in backtests.
+    ExchOrder = 2,
+    ExchData = 3,
 }
 
 /// Manages the event timestamps to determine the next event to be processed.
@@ -80,12 +82,12 @@ impl EventSet {
 
     #[inline]
     pub fn update_exch_data(&mut self, asset_no: usize, timestamp: i64) {
-        self.update(4 * asset_no + 2, timestamp);
+        self.update(4 * asset_no + 3, timestamp);
     }
 
     #[inline]
     pub fn update_exch_order(&mut self, asset_no: usize, timestamp: i64) {
-        self.update(4 * asset_no + 3, timestamp);
+        self.update(4 * asset_no + 2, timestamp);
     }
 
     #[inline]
@@ -101,6 +103,6 @@ impl EventSet {
 
     #[inline]
     pub fn invalidate_exch_data(&mut self, asset_no: usize) {
-        self.invalidate(4 * asset_no + 2);
+        self.invalidate(4 * asset_no + 3);
     }
 }

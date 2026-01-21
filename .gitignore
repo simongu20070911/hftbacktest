@@ -5,7 +5,10 @@ build
 __pycache__
 venv
 docs/_build
+.DS_Store
 **/Cargo.lock
 **/target
 **/tmp_*
 **/*.so
+.ph_target/
+.ph_artifacts/

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     backtest::data::{Data, DataPtr, POD, npy::parser::Value},
-    utils::CACHE_LINE_SIZE,
+    utils::{AlignedArray, CACHE_LINE_SIZE},
 };
 
 mod parser;
@@ -18,6 +18,22 @@ pub trait NpyDTyped: POD {
 }
 
 pub type DType = Vec<Field>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct NpyReadOptions {
+    /// Allow loading a file even if the field names don't match exactly.
+    ///
+    /// This is unsafe for most use-cases because it can silently swap columns when types match.
+    pub allow_field_name_mismatch: bool,
+}
+
+impl Default for NpyReadOptions {
+    fn default() -> Self {
+        Self {
+            allow_field_name_mismatch: false,
+        }
+    }
+}
 
 /// Representation of a Numpy file header.
 #[derive(PartialEq, Eq, Debug)]
@@ -295,10 +311,25 @@ pub fn read_npy<R: Read, D: NpyDTyped + Clone>(
     reader: &mut R,
     size: usize,
 ) -> std::io::Result<Data<D>> {
+    read_npy_with_options::<R, D>(reader, size, NpyReadOptions::default())
+}
+
+pub fn read_npy_with_options<R: Read, D: NpyDTyped + Clone>(
+    reader: &mut R,
+    size: usize,
+    options: NpyReadOptions,
+) -> std::io::Result<Data<D>> {
     if size == 0 {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "empty input",
+        ));
+    }
+
+    if size > AlignedArray::<u8, CACHE_LINE_SIZE>::MAX_CAPACITY {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "input too large",
         ));
     }
 
@@ -373,7 +404,16 @@ pub fn read_npy<R: Read, D: NpyDTyped + Clone>(
     if expected_descr != header.descr {
         match check_field_consistency(&expected_descr, &header.descr) {
             Ok(diff) => {
-                println!("Warning: Field name mismatch - {diff:?}");
+                if !diff.is_empty() {
+                    if options.allow_field_name_mismatch {
+                        tracing::warn!("Field name mismatch while loading .npy: {diff:?}");
+                    } else {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("Field name mismatch: {diff:?}"),
+                        ));
+                    }
+                }
             }
             Err(err) => {
                 return Err(Error::new(ErrorKind::InvalidData, err));
@@ -479,6 +519,28 @@ mod tests {
         }
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Row2Swapped {
+        b: i64,
+        a: i64,
+    }
+    unsafe impl POD for Row2Swapped {}
+    impl NpyDTyped for Row2Swapped {
+        fn descr() -> DType {
+            vec![
+                Field {
+                    name: "b".to_string(),
+                    ty: "<i8".to_string(),
+                },
+                Field {
+                    name: "a".to_string(),
+                    ty: "<i8".to_string(),
+                },
+            ]
+        }
+    }
+
     #[test]
     fn read_npy_rejects_empty_input() {
         let mut cursor = Cursor::new(Vec::new());
@@ -523,6 +585,32 @@ mod tests {
     }
 
     #[test]
+    fn read_npy_rejects_field_name_mismatch_by_default() {
+        let mut buf = Vec::new();
+        write_npy(&mut buf, &[Row2Swapped { b: 1, a: 2 }]).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let size = cursor.get_ref().len();
+        let err = read_npy::<_, Row2>(&mut cursor, size).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_npy_allows_field_name_mismatch_with_explicit_option() {
+        let mut buf = Vec::new();
+        write_npy(&mut buf, &[Row2Swapped { b: 1, a: 2 }]).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let size = cursor.get_ref().len();
+        let data =
+            read_npy_with_options::<_, Row2>(&mut cursor, size, NpyReadOptions {
+                allow_field_name_mismatch: true,
+            })
+            .unwrap();
+        assert_eq!(data.len(), 1);
+    }
+
+    #[test]
     fn from_header_rejects_missing_required_keys() {
         let err = NpyHeader::from_header("{'fortran_order': False, 'shape': (1,)}").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
@@ -546,22 +634,105 @@ mod tests {
         let err = read_npy::<_, Row1>(&mut cursor, size).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn read_npy_rejects_oversized_input_without_panicking() {
+        let oversize = AlignedArray::<u8, CACHE_LINE_SIZE>::MAX_CAPACITY + 1;
+        let result = std::panic::catch_unwind(|| {
+            let mut cursor = Cursor::new(Vec::new());
+            read_npy::<_, Row1>(&mut cursor, oversize)
+        });
+
+        let err = result
+            .expect("read_npy must return an error, not panic, on oversized input")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_npz_rejects_entry_size_mismatch_without_hanging() {
+        use std::{
+            io::Write as _,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let mut zip_buf = Cursor::new(Vec::new());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut zip = zip::ZipWriter::new(&mut zip_buf);
+        zip.start_file("data.npy", options).unwrap();
+        write_npy(&mut zip, &[Row1 { a: 1 }]).unwrap();
+        zip.finish().unwrap();
+
+        let mut zip_bytes = zip_buf.into_inner();
+
+        // Corrupt the stored "uncompressed size" in the central directory (+1), leaving the
+        // actual stored data intact. Older implementations that treated `read()==Ok(0)` as a
+        // retry could hang indefinitely when attempting to read the (now) missing byte.
+        let central_sig = b"PK\x01\x02";
+        let Some(central_idx) = zip_bytes
+            .windows(central_sig.len())
+            .rposition(|w| w == central_sig)
+        else {
+            panic!("central directory signature not found");
+        };
+        let usize_off = central_idx + 24;
+        let cur_size = u32::from_le_bytes(
+            zip_bytes[usize_off..usize_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let new_size = cur_size + 1;
+        zip_bytes[usize_off..usize_off + 4].copy_from_slice(&new_size.to_le_bytes());
+
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!(
+            "hftbacktest_read_npz_entry_size_mismatch_{}_{}.npz",
+            std::process::id(),
+            nanos
+        ));
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&zip_bytes).unwrap();
+        drop(file);
+
+        let filepath = path.to_str().unwrap();
+        let err = read_npz_file::<Row1>(filepath, "data").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
-/// Reads a structured array `numpy` file. Currently, it doesn't check if the data structure is the
-/// same as what the file contains. Users should be cautious about this.
+/// Reads a structured array `numpy` file and validates its schema against `D::descr()`.
 ///
 /// # S3 Support
 /// Supports S3 paths in format: `s3://bucket-name/path/to/file.npy` when the "s3" feature is enabled.
 /// Enable the feature in Cargo.toml: `features = ["s3"]`
 pub fn read_npy_file<D: NpyDTyped + Clone>(filepath: &str) -> std::io::Result<Data<D>> {
+    read_npy_file_with_options(filepath, NpyReadOptions::default())
+}
+
+/// Reads a structured array `numpy` file, allowing callers to override schema validation behavior.
+pub fn read_npy_file_with_options<D: NpyDTyped + Clone>(
+    filepath: &str,
+    options: NpyReadOptions,
+) -> std::io::Result<Data<D>> {
     if filepath.starts_with("s3://") {
         #[cfg(feature = "s3")]
         {
             let data = s3_support::read_s3_object(filepath)?;
             let size = data.len();
             let mut cursor = Cursor::new(data);
-            read_npy(&mut cursor, size)
+            if options.allow_field_name_mismatch {
+                read_npy_with_options(&mut cursor, size, options)
+            } else {
+                read_npy(&mut cursor, size)
+            }
         }
 
         #[cfg(not(feature = "s3"))]
@@ -575,17 +746,30 @@ pub fn read_npy_file<D: NpyDTyped + Clone>(filepath: &str) -> std::io::Result<Da
         let mut file = File::open(filepath)?;
         file.sync_all()?;
         let size = file.metadata()?.len() as usize;
-        read_npy(&mut file, size)
+        if options.allow_field_name_mismatch {
+            read_npy_with_options(&mut file, size, options)
+        } else {
+            read_npy(&mut file, size)
+        }
     }
 }
 
-/// Reads a structured array `numpy` zip archived file. Currently, it doesn't check if the data
-/// structure is the same as what the file contains. Users should be cautious about this.
+/// Reads a structured array `numpy` zip archived file and validates its schema against `D::descr()`.
 ///
 /// # S3 Support
 /// Supports S3 paths in format: `s3://bucket-name/path/to/file.npz` when the "s3" feature is enabled.
 /// Enable the feature in Cargo.toml: `features = ["s3"]`
 pub fn read_npz_file<D: NpyDTyped + Clone>(filepath: &str, name: &str) -> std::io::Result<Data<D>> {
+    read_npz_file_with_options(filepath, name, NpyReadOptions::default())
+}
+
+/// Reads a structured array `numpy` zip archived file, allowing callers to override schema
+/// validation behavior.
+pub fn read_npz_file_with_options<D: NpyDTyped + Clone>(
+    filepath: &str,
+    name: &str,
+    options: NpyReadOptions,
+) -> std::io::Result<Data<D>> {
     if filepath.starts_with("s3://") {
         #[cfg(feature = "s3")]
         {
@@ -594,7 +778,11 @@ pub fn read_npz_file<D: NpyDTyped + Clone>(filepath: &str, name: &str) -> std::i
             let mut archive = zip::ZipArchive::new(cursor)?;
             let mut file = archive.by_name(&format!("{name}.npy"))?;
             let size = file.size() as usize;
-            read_npy(&mut file, size)
+            if options.allow_field_name_mismatch {
+                read_npy_with_options(&mut file, size, options)
+            } else {
+                read_npy(&mut file, size)
+            }
         }
 
         #[cfg(not(feature = "s3"))]
@@ -608,7 +796,11 @@ pub fn read_npz_file<D: NpyDTyped + Clone>(filepath: &str, name: &str) -> std::i
         let mut archive = zip::ZipArchive::new(File::open(filepath)?)?;
         let mut file = archive.by_name(&format!("{name}.npy"))?;
         let size = file.size() as usize;
-        read_npy(&mut file, size)
+        if options.allow_field_name_mismatch {
+            read_npy_with_options(&mut file, size, options)
+        } else {
+            read_npy(&mut file, size)
+        }
     }
 }
 
