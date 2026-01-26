@@ -103,6 +103,17 @@ where
         Ok(())
     }
 
+    fn reject_order_not_found(order: &mut Order, timestamp: i64) {
+        // Under this backtest world model, OrderNotFound implies the order is not active on the
+        // exchange (it has already been filled/canceled/expired). Mark it inactive immediately so
+        // the local never keeps a "working" ghost order after an OrderNotFound reject.
+        order.req = Status::Rejected;
+        order.exec_qty = 0.0;
+        order.leaves_qty = 0.0;
+        order.status = Status::Expired;
+        order.exch_timestamp = timestamp;
+    }
+
     fn fill<const MAKE_RESPONSE: bool>(
         &mut self,
         order: &mut Order,
@@ -292,8 +303,7 @@ where
                 Ok(())
             }
             Err(BacktestError::OrderNotFound) => {
-                order.req = Status::Rejected;
-                order.exch_timestamp = timestamp;
+                Self::reject_order_not_found(order, timestamp);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -324,8 +334,7 @@ where
                     return self.ack_new(order, timestamp);
                 }
                 Err(BacktestError::OrderNotFound) => {
-                    order.req = Status::Rejected;
-                    order.exch_timestamp = timestamp;
+                    Self::reject_order_not_found(order, timestamp);
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -344,8 +353,7 @@ where
                 Ok(())
             }
             Err(BacktestError::OrderNotFound) => {
-                order.req = Status::Rejected;
-                order.exch_timestamp = timestamp;
+                Self::reject_order_not_found(order, timestamp);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -581,6 +589,84 @@ mod tests {
                 order.order_id
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ack_modify_order_not_found_marks_inactive() -> Result<(), crate::backtest::BacktestError> {
+        let mut depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        // Best bid = 99, best ask = 101.
+        depth.add_buy_order(/* order_id */ 1, /* px */ 99.0, /* qty */ 1.0, /* ts */ 0)?;
+        depth.add_sell_order(/* order_id */ 2, /* px */ 101.0, /* qty */ 1.0, /* ts */ 0)?;
+
+        let state = State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        );
+        let queue_model = L3FIFOQueueModel::new();
+        let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
+
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+
+        // No such order exists on the exchange queue model. A modify must reject and mark the
+        // order inactive under this world model (it was already removed on the exchange).
+        let mut order = Order::new(
+            /* order_id */ 10,
+            /* price_tick */ 100,
+            /* tick_size */ 1.0,
+            /* qty */ 1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        order.req = Status::None;
+        order.local_timestamp = 123;
+
+        exch.ack_modify::<false>(&mut order, /* ts */ 7)?;
+        assert_eq!(order.req, Status::Rejected);
+        assert_eq!(order.status, Status::Expired);
+        assert_eq!(order.exec_qty, 0.0);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.exch_timestamp, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn ack_cancel_order_not_found_marks_inactive() -> Result<(), crate::backtest::BacktestError> {
+        let mut depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        // Best bid = 99, best ask = 101.
+        depth.add_buy_order(/* order_id */ 1, /* px */ 99.0, /* qty */ 1.0, /* ts */ 0)?;
+        depth.add_sell_order(/* order_id */ 2, /* px */ 101.0, /* qty */ 1.0, /* ts */ 0)?;
+
+        let state = State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        );
+        let queue_model = L3FIFOQueueModel::new();
+        let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
+
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+
+        let mut order = Order::new(
+            /* order_id */ 10,
+            /* price_tick */ 100,
+            /* tick_size */ 1.0,
+            /* qty */ 1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        order.req = Status::None;
+        order.local_timestamp = 123;
+
+        exch.ack_cancel(&mut order, /* ts */ 7)?;
+        assert_eq!(order.req, Status::Rejected);
+        assert_eq!(order.status, Status::Expired);
+        assert_eq!(order.exec_qty, 0.0);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.exch_timestamp, 7);
         Ok(())
     }
 }
