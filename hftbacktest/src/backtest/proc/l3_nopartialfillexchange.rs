@@ -685,4 +685,44 @@ mod tests {
         assert_eq!(order.exch_timestamp, 7);
         Ok(())
     }
+
+    #[test]
+    fn ack_cancel_order_not_found_legacy_does_not_force_inactive(
+    ) -> Result<(), crate::backtest::BacktestError> {
+        let mut depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        // Best bid = 99, best ask = 101.
+        depth.add_buy_order(/* order_id */ 1, /* px */ 99.0, /* qty */ 1.0, /* ts */ 0)?;
+        depth.add_sell_order(/* order_id */ 2, /* px */ 101.0, /* qty */ 1.0, /* ts */ 0)?;
+
+        let state = State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        );
+        let queue_model = L3FIFOQueueModel::new();
+        let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
+
+        // Policy is disabled by default.
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+
+        let mut order = Order::new(
+            /* order_id */ 10,
+            /* price_tick */ 100,
+            /* tick_size */ 1.0,
+            /* qty */ 1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        order.req = Status::None;
+        order.local_timestamp = 123;
+
+        exch.ack_cancel(&mut order, /* ts */ 7)?;
+        assert_eq!(order.req, Status::Rejected);
+        // Legacy behavior: reject does not force an inactive terminal status.
+        assert_eq!(order.status, Status::New);
+        assert_eq!(order.leaves_qty, 1.0);
+        assert_eq!(order.exec_qty, 0.0);
+        Ok(())
+    }
 }

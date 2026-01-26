@@ -491,6 +491,15 @@ where
         }
     }
 
+    /// Convenience switch for CME via Databento MBO backtests.
+    ///
+    /// Today this only affects how cancel/modify `OrderNotFound` rejects are represented (see
+    /// [`Self::cme_mbo_order_not_found_reject_marks_inactive`]). Additional CME/MBO-specific
+    /// physics/stability policies can be wired here in the future.
+    pub fn cme_databento_mbo(self, enabled: bool) -> Self {
+        self.cme_mbo_order_not_found_reject_marks_inactive(enabled)
+    }
+
     /// Sets the initial capacity of the vector storing the last market trades.
     /// The default value is `0`, indicating that no last trades are stored.
     pub fn last_trades_capacity(self, capacity: usize) -> Self {
