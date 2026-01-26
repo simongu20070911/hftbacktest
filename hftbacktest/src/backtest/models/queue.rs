@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     marker::PhantomData,
 };
 
@@ -503,16 +503,21 @@ impl L3FIFOQueueModel {
         // Finds the shortest iteration.
         let mut filled = Vec::new();
         if INVALID_FROM || (self.backtest_orders.len() as i64) < from_tick - to_tick {
-            let mut filled_tick = HashSet::new();
+            let mut filled_tick = Vec::new();
             self.backtest_orders.retain(|_, (side, order_price_tick)| {
-                if *side == Side::Buy && *order_price_tick >= to_tick {
-                    filled_tick.insert(*order_price_tick);
+                if *side == Side::Buy
+                    && *order_price_tick >= to_tick
+                    && (INVALID_FROM || *order_price_tick <= from_tick)
+                {
+                    filled_tick.push(*order_price_tick);
                     false
                 } else {
                     true
                 }
             });
-            for order_price_tick in filled_tick {
+            filled_tick.sort_unstable();
+            filled_tick.dedup();
+            for order_price_tick in filled_tick.into_iter().rev() {
                 let queue = self.bid_queue.get_mut(&order_price_tick).unwrap();
                 queue.retain(|order| {
                     if order.is_backtest_order() {
@@ -524,7 +529,7 @@ impl L3FIFOQueueModel {
                 });
             }
         } else {
-            for t in to_tick..(from_tick + 1) {
+            for t in (to_tick..=from_tick).rev() {
                 if let Some(queue) = self.bid_queue.get_mut(&t) {
                     queue.retain(|order| {
                         if order.is_backtest_order() {
@@ -550,15 +555,20 @@ impl L3FIFOQueueModel {
         // Finds the shortest iteration.
         let mut filled = Vec::new();
         if INVALID_FROM || (self.backtest_orders.len() as i64) < to_tick - from_tick {
-            let mut filled_tick = HashSet::new();
+            let mut filled_tick = Vec::new();
             self.backtest_orders.retain(|_, (side, order_price_tick)| {
-                if *side == Side::Sell && *order_price_tick <= to_tick {
-                    filled_tick.insert(*order_price_tick);
+                if *side == Side::Sell
+                    && *order_price_tick <= to_tick
+                    && (INVALID_FROM || *order_price_tick >= from_tick)
+                {
+                    filled_tick.push(*order_price_tick);
                     false
                 } else {
                     true
                 }
             });
+            filled_tick.sort_unstable();
+            filled_tick.dedup();
             for order_price_tick in filled_tick {
                 let queue = self.ask_queue.get_mut(&order_price_tick).unwrap();
                 queue.retain(|order| {
@@ -1248,6 +1258,422 @@ mod l3_tests {
                 &qm, 1
             )
         );
+    }
+
+    #[test]
+    fn crossing_fill_tick_price_priority_bid() {
+        let depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 101,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 2,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_ask_update(
+            &mut qm, 102, 100,
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 2);
+        assert_eq!(filled[0].price_tick, 101);
+        assert_eq!(filled[1].price_tick, 100);
+        assert_eq!(filled[0].order_id, 2);
+        assert_eq!(filled[1].order_id, 1);
+    }
+
+    #[test]
+    fn crossing_fill_tick_price_priority_bid_retain_branch() {
+        let depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        // Two orders at 101 and one at 100 (within range), plus one out-of-range (would have been
+        // crossed already) to ensure both fill branches behave consistently.
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 101,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 2,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 101,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 3,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 250,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 4,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        // Force the retain/sort branch by making the tick-range very large relative to the number
+        // of orders in `backtest_orders`.
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_ask_update(
+            &mut qm, 200, 100,
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 3);
+        assert_eq!(filled[0].order_id, 2);
+        assert_eq!(filled[1].order_id, 3);
+        assert_eq!(filled[2].order_id, 1);
+
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 1
+            )
+        );
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 2
+            )
+        );
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 3
+            )
+        );
+        assert!(
+            <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 4
+            )
+        );
+    }
+
+    #[test]
+    fn crossing_fill_tick_order_sorted_bid_retain_branch_many_levels() {
+        let depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        // Many distinct ticks so that any unordered tick iteration is extremely unlikely to match
+        // strict price-priority by chance.
+        let ticks: Vec<i64> = (100..112).collect();
+        for &tick in &ticks {
+            qm.add_backtest_order(
+                Order {
+                    qty: 1.0,
+                    leaves_qty: 0.0,
+                    exec_qty: 0.0,
+                    exec_price_tick: 0,
+                    price_tick: tick,
+                    tick_size: 1.0,
+                    exch_timestamp: 0,
+                    local_timestamp: 0,
+                    order_id: tick as u64,
+                    q: Box::new(()),
+                    maker: false,
+                    order_type: OrdType::Limit,
+                    req: Status::None,
+                    status: Status::None,
+                    side: Side::Buy,
+                    time_in_force: TimeInForce::GTC,
+                },
+                &depth,
+            )
+            .unwrap();
+        }
+
+        // Force the retain/sort branch by making the tick-range very large relative to the number
+        // of orders in `backtest_orders`.
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_ask_update(
+            &mut qm, 1000, 100,
+        )
+        .unwrap();
+
+        assert_eq!(filled.len(), ticks.len());
+        for w in filled.windows(2) {
+            assert!(w[0].price_tick > w[1].price_tick);
+        }
+        // Sanity: highest tick fills first, lowest tick fills last.
+        assert_eq!(filled[0].price_tick, 111);
+        assert_eq!(filled[0].order_id, 111);
+        assert_eq!(filled[filled.len() - 1].price_tick, 100);
+        assert_eq!(filled[filled.len() - 1].order_id, 100);
+    }
+
+    #[test]
+    fn crossing_fill_tick_price_priority_ask_retain_branch() {
+        let depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Sell,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 2,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Sell,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 101,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 3,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Sell,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+        // Out-of-range ask (would have been crossed already at the previous best bid).
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 70,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 4,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Sell,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        // Force the retain/sort branch.
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_bid_update(
+            &mut qm, 80, 150,
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 3);
+        assert_eq!(filled[0].order_id, 1);
+        assert_eq!(filled[1].order_id, 2);
+        assert_eq!(filled[2].order_id, 3);
+
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 1
+            )
+        );
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 2
+            )
+        );
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 3
+            )
+        );
+        assert!(
+            <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 4
+            )
+        );
+    }
+
+    #[test]
+    fn crossing_fill_tick_order_sorted_ask_retain_branch_many_levels() {
+        let depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        let ticks: Vec<i64> = (100..112).collect();
+        for &tick in &ticks {
+            qm.add_backtest_order(
+                Order {
+                    qty: 1.0,
+                    leaves_qty: 0.0,
+                    exec_qty: 0.0,
+                    exec_price_tick: 0,
+                    price_tick: tick,
+                    tick_size: 1.0,
+                    exch_timestamp: 0,
+                    local_timestamp: 0,
+                    order_id: tick as u64,
+                    q: Box::new(()),
+                    maker: false,
+                    order_type: OrdType::Limit,
+                    req: Status::None,
+                    status: Status::None,
+                    side: Side::Sell,
+                    time_in_force: TimeInForce::GTC,
+                },
+                &depth,
+            )
+            .unwrap();
+        }
+
+        // Force the retain/sort branch.
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_bid_update(
+            &mut qm, 0, 150,
+        )
+        .unwrap();
+
+        assert_eq!(filled.len(), ticks.len());
+        for w in filled.windows(2) {
+            assert!(w[0].price_tick < w[1].price_tick);
+        }
+        assert_eq!(filled[0].price_tick, 100);
+        assert_eq!(filled[0].order_id, 100);
+        assert_eq!(filled[filled.len() - 1].price_tick, 111);
+        assert_eq!(filled[filled.len() - 1].order_id, 111);
     }
 
     #[test]

@@ -305,6 +305,33 @@ where
         order: &mut Order,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
+        // Replace that becomes marketable should be executed (or GTX-expired) immediately.
+        // Process it as cancel+new so it uses the same marketability checks as `ack_new`.
+        let marketable_after_replace = match (order.side, order.order_type) {
+            (Side::Buy, OrdType::Limit) => order.price_tick >= self.depth.best_ask_tick(),
+            (Side::Sell, OrdType::Limit) => order.price_tick <= self.depth.best_bid_tick(),
+            (Side::Buy, OrdType::Market) | (Side::Sell, OrdType::Market) => true,
+            _ => false,
+        };
+        if marketable_after_replace {
+            match self
+                .queue_model
+                .cancel_backtest_order(order.order_id, &self.depth)
+            {
+                Ok(_) => {
+                    // This replace is processed as cancel+new, so reset the remaining quantity.
+                    order.leaves_qty = order.qty;
+                    return self.ack_new(order, timestamp);
+                }
+                Err(BacktestError::OrderNotFound) => {
+                    order.req = Status::Rejected;
+                    order.exch_timestamp = timestamp;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         match self
             .queue_model
             .modify_backtest_order(order.order_id, order, &self.depth)
@@ -450,5 +477,110 @@ where
         self.order_e2l
             .earliest_send_order_timestamp()
             .unwrap_or(i64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::L3NoPartialFillExchange;
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, ConstantLatency, L3FIFOQueueModel, TradingValueFeeModel},
+            order::order_bus,
+            state::State,
+            L3QueueModel,
+        },
+        depth::{HashMapMarketDepth, L3MarketDepth},
+        prelude::{OrdType, Side, Status, TimeInForce},
+        types::Order,
+    };
+
+    #[test]
+    fn ack_modify_that_crosses_executes_as_taker_fill() -> Result<(), crate::backtest::BacktestError>
+    {
+        let mut depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        // Best bid = 99, best ask = 101.
+        depth.add_buy_order(/* order_id */ 1, /* px */ 99.0, /* qty */ 1.0, /* ts */ 0)?;
+        depth.add_sell_order(/* order_id */ 2, /* px */ 101.0, /* qty */ 1.0, /* ts */ 0)?;
+
+        let state = State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        );
+        let queue_model = L3FIFOQueueModel::new();
+        let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
+
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+
+        // Submit a passive buy order at 100 (below the best ask).
+        let mut order = Order::new(
+            /* order_id */ 10,
+            /* price_tick */ 100,
+            /* tick_size */ 1.0,
+            /* qty */ 1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        exch.ack_new(&mut order, /* ts */ 0)?;
+        assert_eq!(order.status, Status::New);
+
+        // Modify the order to cross beyond the book (>= best ask). This must execute immediately
+        // as a taker fill at the current best ask tick (not at the order's limit price).
+        order.price_tick = 110;
+        exch.ack_modify::<false>(&mut order, /* ts */ 1)?;
+
+        assert_eq!(order.status, Status::Filled);
+        assert!(!order.maker);
+        assert_eq!(order.exec_price_tick, 101);
+        assert_ne!(order.exec_price_tick, order.price_tick);
+        assert_eq!(order.exec_qty, 1.0);
+        assert_eq!(order.leaves_qty, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn ack_modify_that_crosses_gtx_expires() -> Result<(), crate::backtest::BacktestError> {
+        let mut depth = HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0);
+        // Best bid = 99, best ask = 101.
+        depth.add_buy_order(/* order_id */ 1, /* px */ 99.0, /* qty */ 1.0, /* ts */ 0)?;
+        depth.add_sell_order(/* order_id */ 2, /* px */ 101.0, /* qty */ 1.0, /* ts */ 0)?;
+
+        let state = State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        );
+        let queue_model = L3FIFOQueueModel::new();
+        let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
+
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+
+        // Submit a passive GTX buy order at 100 (below the best ask).
+        let mut order = Order::new(
+            /* order_id */ 10,
+            /* price_tick */ 100,
+            /* tick_size */ 1.0,
+            /* qty */ 1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTX,
+        );
+        exch.ack_new(&mut order, /* ts */ 0)?;
+        assert_eq!(order.status, Status::New);
+
+        // Modify the order to cross the book. GTX should expire instead of executing.
+        order.price_tick = 110;
+        exch.ack_modify::<false>(&mut order, /* ts */ 1)?;
+
+        assert_eq!(order.status, Status::Expired);
+        assert_eq!(order.exec_qty, 0.0);
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &exch.queue_model,
+                order.order_id
+            )
+        );
+        Ok(())
     }
 }

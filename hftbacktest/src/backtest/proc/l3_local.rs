@@ -308,11 +308,20 @@ where
                     let local_order = entry.get_mut();
                     if order.req == Status::Rejected {
                         if order.local_timestamp == local_order.local_timestamp {
-                            let prev_req = local_order.req;
-                            local_order.update(&order);
-                            local_order.req = Status::None;
-                            if prev_req == Status::New {
-                                local_order.status = Status::Expired;
+                            // A late reject (e.g., cancel/modify OrderNotFound) must not overwrite
+                            // a terminal local order state back to working.
+                            if local_order.status == Status::Expired
+                                || local_order.status == Status::Filled
+                                || local_order.status == Status::Canceled
+                            {
+                                local_order.req = Status::None;
+                            } else {
+                                let prev_req = local_order.req;
+                                local_order.update(&order);
+                                local_order.req = Status::None;
+                                if prev_req == Status::New {
+                                    local_order.status = Status::Expired;
+                                }
                             }
                         }
                     } else {
@@ -339,5 +348,129 @@ where
         self.order_l2e
             .earliest_send_order_timestamp()
             .unwrap_or(i64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, ConstantLatency, TradingValueFeeModel},
+            order::order_bus,
+            proc::{LocalProcessor, Processor},
+            state::State,
+        },
+        depth::HashMapMarketDepth,
+        types::{OrdType, Order, Side, Status, TimeInForce},
+    };
+
+    fn make_state() -> State<LinearAsset, TradingValueFeeModel<CommonFees>> {
+        State::new(
+            LinearAsset::new(1.0),
+            TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+        )
+    }
+
+    fn make_depth() -> HashMapMarketDepth {
+        HashMapMarketDepth::new(1.0, 1.0)
+    }
+
+    #[test]
+    fn late_cancel_reject_does_not_resurrect_filled_order() {
+        let entry_latency = 0;
+        let resp_latency = 10;
+        let (mut order_e2l, order_l2e) = order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
+
+        let order_id = 1;
+        let t_new_local = 0;
+        let t_new_exch = t_new_local + entry_latency;
+
+        // Exchange fill happens before the local submits cancel, but the fill is observed locally
+        // after a response latency.
+        let t_fill_exch = 100;
+        let t_cancel_local = 105;
+        let t_cancel_exch = t_cancel_local + entry_latency;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new_local,
+            )
+            .unwrap();
+
+        // Ack the new order so it becomes cancelable locally.
+        let mut ack = Order::new(
+            order_id,
+            100,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        ack.status = Status::New;
+        ack.req = Status::None;
+        ack.exch_timestamp = t_new_exch;
+        ack.local_timestamp = t_new_local;
+        order_e2l.respond(ack);
+
+        local.process_recv_order(t_new_exch + resp_latency, None).unwrap();
+
+        // Local submits cancel after the exchange fill occurred, but before the fill is observed.
+        local.cancel(order_id, t_cancel_local).unwrap();
+
+        // Deliver the fill response first.
+        let mut fill = Order::new(
+            order_id,
+            100,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        fill.status = Status::Filled;
+        fill.req = Status::None;
+        fill.leaves_qty = 0.0;
+        fill.exec_qty = 1.0;
+        fill.exec_price_tick = 100;
+        fill.maker = true;
+        fill.exch_timestamp = t_fill_exch;
+        order_e2l.respond(fill);
+
+        // And then a late cancel reject (OrderNotFound -> req=Rejected) response.
+        let mut reject = Order::new(
+            order_id,
+            100,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        reject.status = Status::New;
+        reject.req = Status::Rejected;
+        reject.exch_timestamp = t_cancel_exch;
+        reject.local_timestamp = t_cancel_local;
+        order_e2l.respond(reject);
+
+        local.process_recv_order(t_fill_exch + resp_latency, None).unwrap();
+        let after_fill = local.orders().get(&order_id).unwrap().status;
+        assert_eq!(after_fill, Status::Filled);
+
+        local.process_recv_order(t_cancel_exch + resp_latency, None).unwrap();
+        let after_reject = local.orders().get(&order_id).unwrap().status;
+
+        // Monotonic state invariant: terminal status must not regress to working due to a late reject.
+        assert_eq!(after_reject, Status::Filled);
+        assert_eq!(local.orders().get(&order_id).unwrap().req, Status::None);
     }
 }
