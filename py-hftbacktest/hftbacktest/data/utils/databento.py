@@ -18,6 +18,17 @@ from ...types import (
     FILL_EVENT,
 )
 
+_EPOCH_NS = "ns"
+
+
+def _epoch_ns_col(name: str) -> pl.Expr:
+    # IMPORTANT: Do not use Python datetime `.timestamp()` here.
+    # - Polars `iter_rows()` yields Python `datetime` values with *microsecond* precision, even if
+    #   the underlying column is nanosecond-precise.
+    # - `.timestamp()` also roundtrips through floating-point seconds.
+    # We instead convert to integer nanoseconds inside Polars, preserving the original precision.
+    return pl.col(name).dt.epoch(_EPOCH_NS).alias(name)
+
 
 def convert(
         input_file: str,
@@ -70,9 +81,16 @@ def convert(
 
     snapshot_ts = False
 
-    for rn, (ts_event, action, side, price, size, order_id, flags, ts_recv) in enumerate(df.iter_rows()):
-        exch_ts = int(ts_event.timestamp() * 1_000_000_000)
-        local_ts = int(ts_recv.timestamp() * 1_000_000_000)
+    df = df.with_columns(
+        _epoch_ns_col("ts_event"),
+        _epoch_ns_col("ts_recv"),
+    )
+
+    for rn, (exch_ts, action, side, price, size, order_id, flags, local_ts) in enumerate(
+        df.iter_rows()
+    ):
+        exch_ts = int(exch_ts)
+        local_ts = int(local_ts)
 
         if action == 'A':
             ev = ADD_ORDER_EVENT
