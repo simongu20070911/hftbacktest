@@ -75,60 +75,58 @@ def correct_event_order(
     exch_rn = 0
     local_rn = 0
     while True:
-        sorted_exch = data[sorted_exch_index[exch_rn]]
-        sorted_local = data[sorted_local_index[local_rn]]
-        if (
-                exch_rn < len(data)
-                and local_rn < len(data)
-                and sorted_exch.exch_ts == sorted_local.exch_ts
-                and sorted_exch.local_ts == sorted_local.local_ts
-        ):
-            assert sorted_exch.ev == sorted_local.ev
-            assert (sorted_exch.px == sorted_local.px) or (np.isnan(sorted_exch.px) and np.isnan(sorted_local.px))
-            assert sorted_exch.qty == sorted_local.qty
+        if exch_rn < len(data) and local_rn < len(data):
+            sorted_exch = data[sorted_exch_index[exch_rn]]
+            sorted_local = data[sorted_local_index[local_rn]]
+            if (
+                    sorted_exch.exch_ts == sorted_local.exch_ts
+                    and sorted_exch.local_ts == sorted_local.local_ts
+            ):
+                assert sorted_exch.ev == sorted_local.ev
+                assert (sorted_exch.px == sorted_local.px) or (np.isnan(sorted_exch.px) and np.isnan(sorted_local.px))
+                assert sorted_exch.qty == sorted_local.qty
 
-            sorted_final[out_rn] = sorted_exch
-            sorted_final[out_rn].ev = sorted_final[out_rn].ev | EXCH_EVENT | LOCAL_EVENT
+                sorted_final[out_rn] = sorted_exch
+                sorted_final[out_rn].ev = sorted_final[out_rn].ev | EXCH_EVENT | LOCAL_EVENT
 
-            out_rn += 1
-            exch_rn += 1
-            local_rn += 1
-        elif ((
-                exch_rn < len(data)
-                and local_rn < len(data)
-                and sorted_exch.exch_ts == sorted_local.exch_ts
-                and sorted_exch.local_ts < sorted_local.local_ts
-        ) or (
-                exch_rn < len(data)
-                and sorted_exch.exch_ts < sorted_local.exch_ts
-        )):
+                out_rn += 1
+                exch_rn += 1
+                local_rn += 1
+            elif ((
+                    sorted_exch.exch_ts == sorted_local.exch_ts
+                    and sorted_exch.local_ts < sorted_local.local_ts
+            ) or (
+                    sorted_exch.exch_ts < sorted_local.exch_ts
+            )):
+                # exchange
+                sorted_final[out_rn] = sorted_exch
+                sorted_final[out_rn].ev = sorted_final[out_rn].ev | EXCH_EVENT
+
+                out_rn += 1
+                exch_rn += 1
+            else:
+                # local
+                sorted_final[out_rn] = sorted_local
+                sorted_final[out_rn].ev = sorted_final[out_rn].ev | LOCAL_EVENT
+
+                out_rn += 1
+                local_rn += 1
+        elif exch_rn < len(data):
+            sorted_exch = data[sorted_exch_index[exch_rn]]
             # exchange
             sorted_final[out_rn] = sorted_exch
             sorted_final[out_rn].ev = sorted_final[out_rn].ev | EXCH_EVENT
 
             out_rn += 1
             exch_rn += 1
-        elif ((
-                exch_rn < len(data)
-                and local_rn < len(data)
-                and sorted_exch.exch_ts == sorted_local.exch_ts
-                and sorted_exch.local_ts > sorted_local.local_ts
-        ) or (
-                local_rn < len(data)
-        )):
+        elif local_rn < len(data):
+            sorted_local = data[sorted_local_index[local_rn]]
             # local
             sorted_final[out_rn] = sorted_local
             sorted_final[out_rn].ev = sorted_final[out_rn].ev | LOCAL_EVENT
 
             out_rn += 1
             local_rn += 1
-        elif exch_rn < len(data):
-            # exchange
-            sorted_final[out_rn] = sorted_exch
-            sorted_final[out_rn].ev = sorted_final[out_rn].ev | EXCH_EVENT
-
-            out_rn += 1
-            exch_rn += 1
         else:
             assert exch_rn == len(data)
             assert local_rn == len(data)
