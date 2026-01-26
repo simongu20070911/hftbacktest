@@ -67,6 +67,7 @@ where
     state: State<AT, FM>,
     queue_model: QM,
     order_e2l: ExchToLocal<LM>,
+    order_not_found_reject_marks_inactive: bool,
 }
 
 impl<AT, LM, QM, MD, FM> L3NoPartialFillExchange<AT, LM, QM, MD, FM>
@@ -90,7 +91,20 @@ where
             state,
             queue_model,
             order_e2l,
+            order_not_found_reject_marks_inactive: false,
         }
+    }
+
+    /// Sets how `OrderNotFound` rejects are represented in responses.
+    ///
+    /// When enabled, `OrderNotFound` for cancel/modify is treated as "order is not active on the
+    /// exchange" and the response marks the order inactive (`Expired`, `leaves_qty=0`).
+    ///
+    /// This is useful for CME/Databento MBO reachability-gated backtests to avoid transient "ghost
+    /// working" local orders in cancel/modify race windows.
+    pub fn with_order_not_found_reject_marks_inactive(mut self, enabled: bool) -> Self {
+        self.order_not_found_reject_marks_inactive = enabled;
+        self
     }
 
     fn expired(&mut self, mut order: Order, timestamp: i64) -> Result<(), BacktestError> {
@@ -103,15 +117,15 @@ where
         Ok(())
     }
 
-    fn reject_order_not_found(order: &mut Order, timestamp: i64) {
-        // Under this backtest world model, OrderNotFound implies the order is not active on the
-        // exchange (it has already been filled/canceled/expired). Mark it inactive immediately so
-        // the local never keeps a "working" ghost order after an OrderNotFound reject.
+    fn reject_order_not_found(&self, order: &mut Order, timestamp: i64) {
         order.req = Status::Rejected;
-        order.exec_qty = 0.0;
-        order.leaves_qty = 0.0;
-        order.status = Status::Expired;
         order.exch_timestamp = timestamp;
+        if self.order_not_found_reject_marks_inactive {
+            // Treat as "order not active on exchange" (CME/Databento MBO policy).
+            order.exec_qty = 0.0;
+            order.leaves_qty = 0.0;
+            order.status = Status::Expired;
+        }
     }
 
     fn fill<const MAKE_RESPONSE: bool>(
@@ -303,7 +317,7 @@ where
                 Ok(())
             }
             Err(BacktestError::OrderNotFound) => {
-                Self::reject_order_not_found(order, timestamp);
+                self.reject_order_not_found(order, timestamp);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -334,7 +348,7 @@ where
                     return self.ack_new(order, timestamp);
                 }
                 Err(BacktestError::OrderNotFound) => {
-                    Self::reject_order_not_found(order, timestamp);
+                    self.reject_order_not_found(order, timestamp);
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -353,7 +367,7 @@ where
                 Ok(())
             }
             Err(BacktestError::OrderNotFound) => {
-                Self::reject_order_not_found(order, timestamp);
+                self.reject_order_not_found(order, timestamp);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -606,7 +620,8 @@ mod tests {
         let queue_model = L3FIFOQueueModel::new();
         let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
 
-        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l)
+            .with_order_not_found_reject_marks_inactive(true);
 
         // No such order exists on the exchange queue model. A modify must reject and mark the
         // order inactive under this world model (it was already removed on the exchange).
@@ -646,7 +661,8 @@ mod tests {
         let queue_model = L3FIFOQueueModel::new();
         let (order_e2l, _l2e) = order_bus(ConstantLatency::new(0, 0));
 
-        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l);
+        let mut exch = L3NoPartialFillExchange::new(depth, state, queue_model, order_e2l)
+            .with_order_not_found_reject_marks_inactive(true);
 
         let mut order = Order::new(
             /* order_id */ 10,

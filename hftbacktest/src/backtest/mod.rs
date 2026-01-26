@@ -384,6 +384,7 @@ pub struct L3AssetBuilder<LM, AT, QM, MD, FM> {
     last_trades_cap: usize,
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
+    cme_mbo_order_not_found_reject_marks_inactive: bool,
 }
 
 impl<LM, AT, QM, MD, FM> L3AssetBuilder<LM, AT, QM, MD, FM>
@@ -409,6 +410,7 @@ where
             last_trades_cap: 0,
             queue_model: None,
             depth_builder: None,
+            cme_mbo_order_not_found_reject_marks_inactive: false,
         }
     }
 
@@ -475,6 +477,18 @@ where
     /// Sets an exchange model. The default value is [`NoPartialFillExchange`].
     pub fn exchange(self, exch_kind: ExchangeKind) -> Self {
         Self { exch_kind, ..self }
+    }
+
+    /// CME/Databento MBO policy: treat cancel/modify `OrderNotFound` rejects as "order not active",
+    /// so the reject response marks the order inactive immediately (avoids transient ghost working
+    /// orders in race windows).
+    ///
+    /// Default: `false` (keep legacy behavior).
+    pub fn cme_mbo_order_not_found_reject_marks_inactive(self, enabled: bool) -> Self {
+        Self {
+            cme_mbo_order_not_found_reject_marks_inactive: enabled,
+            ..self
+        }
     }
 
     /// Sets the initial capacity of the vector storing the last market trades.
@@ -574,6 +588,9 @@ where
                     State::new(asset_type, fee_model),
                     queue_model,
                     order_e2l,
+                )
+                .with_order_not_found_reject_marks_inactive(
+                    self.cme_mbo_order_not_found_reject_marks_inactive,
                 );
 
                 Ok(Asset {
