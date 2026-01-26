@@ -11,9 +11,11 @@ pub use partialfillexchange::PartialFillExchange;
 mod l3_local;
 
 mod l3_nopartialfillexchange;
+mod l3_partialfillexchange;
 
 pub use l3_local::L3Local;
 pub use l3_nopartialfillexchange::L3NoPartialFillExchange;
+pub use l3_partialfillexchange::L3PartialFillExchange;
 
 use crate::{
     backtest::BacktestError,

@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub use crate::backtest::{
     models::L3QueueModel,
-    proc::{L3Local, L3NoPartialFillExchange},
+    proc::{L3Local, L3NoPartialFillExchange, L3PartialFillExchange},
 };
 use crate::{
     backtest::{
@@ -20,7 +20,14 @@ use crate::{
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
         order::{order_bus, order_bus_with_max_timestamp_reordering},
-        proc::{Local, LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor},
+        proc::{
+            Local,
+            LocalProcessor,
+            L3PartialFillExchange,
+            NoPartialFillExchange,
+            PartialFillExchange,
+            Processor,
+        },
         state::State,
     },
     depth::{L2MarketDepth, L3MarketDepth, MarketDepth},
@@ -385,6 +392,7 @@ pub struct L3AssetBuilder<LM, AT, QM, MD, FM> {
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
     cme_mbo_order_not_found_reject_marks_inactive: bool,
+    cme_databento_mbo: bool,
 }
 
 impl<LM, AT, QM, MD, FM> L3AssetBuilder<LM, AT, QM, MD, FM>
@@ -411,6 +419,7 @@ where
             queue_model: None,
             depth_builder: None,
             cme_mbo_order_not_found_reject_marks_inactive: false,
+            cme_databento_mbo: false,
         }
     }
 
@@ -493,11 +502,21 @@ where
 
     /// Convenience switch for CME via Databento MBO backtests.
     ///
-    /// Today this only affects how cancel/modify `OrderNotFound` rejects are represented (see
-    /// [`Self::cme_mbo_order_not_found_reject_marks_inactive`]). Additional CME/MBO-specific
-    /// physics/stability policies can be wired here in the future.
+    /// Enables CME/MBO-specific physics policies:
+    /// - `EXCH_FILL_EVENT` quantity budgeting (partial fills).
+    /// - Taker execution capped by top-of-book liquidity (no infinite-liquidity fills).
+    /// - Cancel/modify `OrderNotFound` rejects mark orders inactive (no ghost working orders).
     pub fn cme_databento_mbo(self, enabled: bool) -> Self {
-        self.cme_mbo_order_not_found_reject_marks_inactive(enabled)
+        if enabled {
+            Self {
+                cme_databento_mbo: true,
+                exch_kind: ExchangeKind::PartialFillExchange,
+                cme_mbo_order_not_found_reject_marks_inactive: true,
+                ..self
+            }
+        } else {
+            self
+        }
     }
 
     /// Sets the initial capacity of the vector storing the last market trades.
@@ -609,7 +628,27 @@ where
                 })
             }
             ExchangeKind::PartialFillExchange => {
-                unimplemented!();
+                if !self.cme_databento_mbo {
+                    return Err(BuildError::InvalidArgument(
+                        "L3 PartialFillExchange is only supported for CME Databento MBO via `cme_databento_mbo(true)`",
+                    ));
+                }
+
+                let exch = L3PartialFillExchange::new(
+                    create_depth(),
+                    State::new(asset_type, fee_model),
+                    queue_model,
+                    order_e2l,
+                )
+                .with_order_not_found_reject_marks_inactive(
+                    self.cme_mbo_order_not_found_reject_marks_inactive,
+                );
+
+                Ok(Asset {
+                    local: Box::new(local),
+                    exch: Box::new(exch),
+                    reader,
+                })
             }
         }
     }

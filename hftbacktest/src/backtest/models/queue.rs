@@ -452,6 +452,37 @@ pub trait L3QueueModel<MD> {
         depth: &MD,
     ) -> Result<Vec<Order>, BacktestError>;
 
+    /// Invoked when an order is filled from the market feed, with an explicit execution-quantity
+    /// budget.
+    ///
+    /// This is useful for CME/Databento MBO where the fill (`F`) message quantity is frequently
+    /// partial and repeats per `order_id`.
+    ///
+    /// Default implementation maps [`fill_market_feed_order`](L3QueueModel::fill_market_feed_order)
+    /// to full fills.
+    fn fill_market_feed_order_budgeted<const DELETE: bool>(
+        &mut self,
+        order_id: OrderId,
+        order: &Event,
+        depth: &MD,
+        exec_qty: f64,
+    ) -> Result<Vec<(Order, f64)>, BacktestError> {
+        let mut remaining = exec_qty.max(0.0);
+        if remaining == 0.0 {
+            return Ok(vec![]);
+        }
+
+        let filled = self.fill_market_feed_order::<DELETE>(order_id, order, depth)?;
+        Ok(filled
+            .into_iter()
+            .map(|o| {
+                let exec = o.leaves_qty.min(remaining);
+                remaining -= exec;
+                (o, exec)
+            })
+            .collect())
+    }
+
     /// Invoked when a clear order message is received. Returns the expired orders due to the clear
     /// message.
     ///
@@ -1134,6 +1165,81 @@ where
                 unreachable!()
             }
         }
+    }
+
+    fn fill_market_feed_order_budgeted<const DELETE: bool>(
+        &mut self,
+        order_id: OrderId,
+        order: &Event,
+        depth: &MD,
+        mut exec_qty: f64,
+    ) -> Result<Vec<(Order, f64)>, BacktestError> {
+        exec_qty = exec_qty.max(0.0);
+        if exec_qty == 0.0 {
+            return Ok(vec![]);
+        }
+
+        let (side, order_price_tick) = if DELETE {
+            self.mkt_feed_orders
+                .remove(&order_id)
+                .ok_or(BacktestError::OrderNotFound)?
+        } else {
+            *self
+                .mkt_feed_orders
+                .get(&order_id)
+                .ok_or(BacktestError::OrderNotFound)?
+        };
+
+        // CME/Databento MBO interpretation: this fill event provides an execution-quantity for the
+        // specific `order_id` at its price level. Allocate that execution budget to backtest
+        // orders ahead of this market-feed order in the queue at the same tick.
+        let queue = match side {
+            Side::Buy => self.bid_queue.get_mut(&order_price_tick).unwrap(),
+            Side::Sell => self.ask_queue.get_mut(&order_price_tick).unwrap(),
+            Side::None | Side::Unsupported => unreachable!(),
+        };
+
+        let lot_size = depth.lot_size().max(1e-12);
+        let mut filled = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            if exec_qty <= 0.0 {
+                break;
+            }
+
+            let order_in_q = queue.get(i).unwrap();
+            match order_in_q.order_source() {
+                L3OrderSource::MarketFeed if order_in_q.order_id == order_id => {
+                    if DELETE {
+                        queue.remove(i);
+                    }
+                    break;
+                }
+                L3OrderSource::MarketFeed => {
+                    i += 1;
+                }
+                L3OrderSource::Backtest => {
+                    let order_before = order_in_q.clone();
+                    let exec = order_before.leaves_qty.min(exec_qty);
+                    if exec <= 0.0 {
+                        break;
+                    }
+
+                    let order_mut = queue.get_mut(i).unwrap();
+                    order_mut.leaves_qty -= exec;
+                    exec_qty -= exec;
+                    filled.push((order_before, exec));
+
+                    if (order_mut.leaves_qty / lot_size).round() <= 0.0 {
+                        let removed = queue.remove(i).unwrap();
+                        self.backtest_orders.remove(&removed.order_id);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        Ok(filled)
     }
 }
 
