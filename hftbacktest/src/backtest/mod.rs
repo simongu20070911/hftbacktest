@@ -23,7 +23,6 @@ use crate::{
         proc::{
             Local,
             LocalProcessor,
-            L3PartialFillExchange,
             NoPartialFillExchange,
             PartialFillExchange,
             Processor,

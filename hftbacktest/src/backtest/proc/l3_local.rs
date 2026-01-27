@@ -11,23 +11,10 @@ use crate::{
     },
     depth::L3MarketDepth,
     types::{
-        Event,
-        LOCAL_ASK_ADD_ORDER_EVENT,
-        LOCAL_ASK_DEPTH_CLEAR_EVENT,
-        LOCAL_BID_ADD_ORDER_EVENT,
-        LOCAL_BID_DEPTH_CLEAR_EVENT,
-        LOCAL_CANCEL_ORDER_EVENT,
-        LOCAL_DEPTH_CLEAR_EVENT,
-        LOCAL_EVENT,
-        LOCAL_MODIFY_ORDER_EVENT,
-        LOCAL_TRADE_EVENT,
-        OrdType,
-        Order,
-        OrderId,
-        Side,
-        StateValues,
-        Status,
-        TimeInForce,
+        Event, LOCAL_ASK_ADD_ORDER_EVENT, LOCAL_ASK_DEPTH_CLEAR_EVENT, LOCAL_BID_ADD_ORDER_EVENT,
+        LOCAL_BID_DEPTH_CLEAR_EVENT, LOCAL_CANCEL_ORDER_EVENT, LOCAL_DEPTH_CLEAR_EVENT,
+        LOCAL_EVENT, LOCAL_MODIFY_ORDER_EVENT, LOCAL_TRADE_EVENT, OrdType, Order, OrderId, Side,
+        StateValues, Status, TimeInForce,
     },
 };
 
@@ -40,6 +27,12 @@ where
     FM: FeeModel,
 {
     orders: HashMap<OrderId, Order>,
+    /// Original (price_tick, qty, leaves_qty) snapshot for an in-flight replace request.
+    ///
+    /// L3Local::modify() pre-mutates the local order to model the local's optimistic view.
+    /// If the exchange later rejects the replace (e.g., OrderNotFound), we must restore the
+    /// original fields to keep the local order state consistent with the exchange.
+    pending_replace_orig: HashMap<OrderId, (i64, f64, f64)>,
     order_l2e: LocalToExch<LM>,
     depth: MD,
     state: State<AT, FM>,
@@ -64,6 +57,7 @@ where
     ) -> Self {
         Self {
             orders: Default::default(),
+            pending_replace_orig: Default::default(),
             order_l2e,
             depth,
             state,
@@ -139,8 +133,14 @@ where
             return Err(BacktestError::OrderRequestInProcess);
         }
 
+        // NOTE: The local model optimistically applies the requested price/qty immediately.
+        // If the exchange later rejects the replace (e.g., OrderNotFound in a race window),
+        // process_recv_order() must restore the original fields from pending_replace_orig.
         let orig_price_tick = order.price_tick;
         let orig_qty = order.qty;
+        let orig_leaves_qty = order.leaves_qty;
+        self.pending_replace_orig
+            .insert(order_id, (orig_price_tick, orig_qty, orig_leaves_qty));
 
         let price_tick = (price / self.depth.tick_size()).round() as i64;
         order.price_tick = price_tick;
@@ -157,6 +157,7 @@ where
             order.req = Status::Rejected;
             order.price_tick = orig_price_tick;
             order.qty = orig_qty;
+            order.leaves_qty = orig_leaves_qty;
             order.exec_qty = 0.0;
             order.exec_price_tick = 0;
             order.maker = false;
@@ -197,7 +198,11 @@ where
             order.status != Status::Expired
                 && order.status != Status::Filled
                 && order.status != Status::Canceled
-        })
+        });
+        // Keep per-order in-flight snapshots bounded to existing orders.
+        // (This also covers late exchange rejects after an order is removed.)
+        self.pending_replace_orig
+            .retain(|order_id, _| self.orders.contains_key(order_id));
     }
 
     fn position(&self) -> f64 {
@@ -315,17 +320,42 @@ where
                                 || local_order.status == Status::Canceled
                             {
                                 local_order.req = Status::None;
+                                self.pending_replace_orig.remove(&order.order_id);
                             } else {
                                 let prev_req = local_order.req;
                                 local_order.update(&order);
                                 local_order.req = Status::None;
                                 if prev_req == Status::New {
                                     local_order.status = Status::Expired;
+                                } else if prev_req == Status::Replaced {
+                                    // Exchange-side replace rejects must not apply the attempted
+                                    // price/qty to the local order (L3LOCAL-001).
+                                    if let Some((orig_price_tick, orig_qty, orig_leaves_qty)) =
+                                        self.pending_replace_orig.remove(&order.order_id)
+                                    {
+                                        local_order.price_tick = orig_price_tick;
+                                        local_order.qty = orig_qty;
+                                        // If the exchange marks the order inactive on reject
+                                        // (CME/Databento MBO policy), keep leaves_qty as provided
+                                        // by the response (typically 0).
+                                        if local_order.status != Status::Expired
+                                            && local_order.status != Status::Filled
+                                            && local_order.status != Status::Canceled
+                                        {
+                                            local_order.leaves_qty = orig_leaves_qty;
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else {
+                        let prev_req = local_order.req;
                         local_order.update(&order);
+                        if prev_req == Status::Replaced
+                            && order.local_timestamp == local_order.local_timestamp
+                        {
+                            self.pending_replace_orig.remove(&order.order_id);
+                        }
                     }
                 }
                 Entry::Vacant(entry) => {
@@ -380,7 +410,8 @@ mod tests {
     fn late_cancel_reject_does_not_resurrect_filled_order() {
         let entry_latency = 0;
         let resp_latency = 10;
-        let (mut order_e2l, order_l2e) = order_bus(ConstantLatency::new(entry_latency, resp_latency));
+        let (mut order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(entry_latency, resp_latency));
 
         let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
 
@@ -422,7 +453,9 @@ mod tests {
         ack.local_timestamp = t_new_local;
         order_e2l.respond(ack);
 
-        local.process_recv_order(t_new_exch + resp_latency, None).unwrap();
+        local
+            .process_recv_order(t_new_exch + resp_latency, None)
+            .unwrap();
 
         // Local submits cancel after the exchange fill occurred, but before the fill is observed.
         local.cancel(order_id, t_cancel_local).unwrap();
@@ -462,15 +495,179 @@ mod tests {
         reject.local_timestamp = t_cancel_local;
         order_e2l.respond(reject);
 
-        local.process_recv_order(t_fill_exch + resp_latency, None).unwrap();
+        local
+            .process_recv_order(t_fill_exch + resp_latency, None)
+            .unwrap();
         let after_fill = local.orders().get(&order_id).unwrap().status;
         assert_eq!(after_fill, Status::Filled);
 
-        local.process_recv_order(t_cancel_exch + resp_latency, None).unwrap();
+        local
+            .process_recv_order(t_cancel_exch + resp_latency, None)
+            .unwrap();
         let after_reject = local.orders().get(&order_id).unwrap().status;
 
         // Monotonic state invariant: terminal status must not regress to working due to a late reject.
         assert_eq!(after_reject, Status::Filled);
         assert_eq!(local.orders().get(&order_id).unwrap().req, Status::None);
+    }
+
+    #[test]
+    fn replace_reject_restores_original_price_and_qty() {
+        let entry_latency = 0;
+        let resp_latency = 0;
+        let (mut order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
+
+        let order_id = 1;
+        let t_new_local = 1;
+        let t_new_exch = t_new_local + entry_latency;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new_local,
+            )
+            .unwrap();
+
+        // Ack the new order so it becomes modifiable locally.
+        let mut ack = Order::new(
+            order_id,
+            100,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        ack.status = Status::New;
+        ack.req = Status::None;
+        ack.exch_timestamp = t_new_exch;
+        ack.local_timestamp = t_new_local;
+        order_e2l.respond(ack);
+        local
+            .process_recv_order(t_new_exch + resp_latency, None)
+            .unwrap();
+
+        // Submit a replace locally (optimistically updates price/qty).
+        let t_replace_local = 2;
+        local.modify(order_id, 101.0, 2.0, t_replace_local).unwrap();
+        let before_resp = local.orders().get(&order_id).unwrap();
+        assert_eq!(before_resp.price_tick, 101);
+        assert_eq!(before_resp.qty, 2.0);
+
+        // Exchange rejects the replace (e.g., OrderNotFound); it may echo the attempted price/qty.
+        let t_replace_exch = t_replace_local + entry_latency;
+        let mut reject = Order::new(
+            order_id,
+            101,
+            1.0,
+            2.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        reject.status = Status::New;
+        reject.req = Status::Rejected;
+        reject.leaves_qty = 2.0;
+        reject.exch_timestamp = t_replace_exch;
+        reject.local_timestamp = t_replace_local;
+        order_e2l.respond(reject);
+
+        local
+            .process_recv_order(t_replace_exch + resp_latency, None)
+            .unwrap();
+
+        // Local must revert price/qty/leaves_qty to the pre-replace state.
+        let after_reject = local.orders().get(&order_id).unwrap();
+        assert_eq!(after_reject.req, Status::None);
+        assert_eq!(after_reject.status, Status::New);
+        assert_eq!(after_reject.price_tick, 100);
+        assert_eq!(after_reject.qty, 1.0);
+        assert_eq!(after_reject.leaves_qty, 1.0);
+    }
+
+    #[test]
+    fn replace_reject_marks_inactive_keeps_leaves_qty_zero() {
+        let entry_latency = 0;
+        let resp_latency = 0;
+        let (mut order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
+
+        let order_id = 1;
+        let t_new_local = 1;
+        let t_new_exch = t_new_local + entry_latency;
+
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                100.0,
+                1.0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                t_new_local,
+            )
+            .unwrap();
+
+        // Ack the new order so it becomes modifiable locally.
+        let mut ack = Order::new(
+            order_id,
+            100,
+            1.0,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        ack.status = Status::New;
+        ack.req = Status::None;
+        ack.exch_timestamp = t_new_exch;
+        ack.local_timestamp = t_new_local;
+        order_e2l.respond(ack);
+        local
+            .process_recv_order(t_new_exch + resp_latency, None)
+            .unwrap();
+
+        // Submit a replace locally (optimistically updates price/qty).
+        let t_replace_local = 2;
+        local.modify(order_id, 101.0, 2.0, t_replace_local).unwrap();
+
+        // Exchange rejects the replace and marks the order inactive (CME/Databento MBO policy).
+        let t_replace_exch = t_replace_local + entry_latency;
+        let mut reject = Order::new(
+            order_id,
+            101,
+            1.0,
+            2.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        reject.status = Status::Expired;
+        reject.req = Status::Rejected;
+        reject.leaves_qty = 0.0;
+        reject.exch_timestamp = t_replace_exch;
+        reject.local_timestamp = t_replace_local;
+        order_e2l.respond(reject);
+
+        local
+            .process_recv_order(t_replace_exch + resp_latency, None)
+            .unwrap();
+
+        let after_reject = local.orders().get(&order_id).unwrap();
+        assert_eq!(after_reject.req, Status::None);
+        assert_eq!(after_reject.status, Status::Expired);
+        assert_eq!(after_reject.price_tick, 100);
+        assert_eq!(after_reject.qty, 1.0);
+        assert_eq!(after_reject.leaves_qty, 0.0);
     }
 }

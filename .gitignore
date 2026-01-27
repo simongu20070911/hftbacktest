@@ -12,3 +12,4 @@ docs/_build
 **/*.so
 .ph_target/
 .ph_artifacts/
+hftbacktest/src.zip
