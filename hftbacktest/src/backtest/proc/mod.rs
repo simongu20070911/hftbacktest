@@ -12,10 +12,12 @@ mod l3_local;
 
 mod l3_nopartialfillexchange;
 mod l3_partialfillexchange;
+mod stop;
 
 pub use l3_local::L3Local;
 pub use l3_nopartialfillexchange::L3NoPartialFillExchange;
 pub use l3_partialfillexchange::L3PartialFillExchange;
+pub use stop::{TriggerOrderKind, TriggerOrderParams};
 
 use crate::{
     backtest::BacktestError,
@@ -50,6 +52,90 @@ where
         time_in_force: TimeInForce,
         current_timestamp: i64,
     ) -> Result<(), BacktestError>;
+
+    /// Submits a stop-market order (server-side trigger). The trigger is evaluated on trade events,
+    /// and once triggered the order becomes an `OrdType::Market` order.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_stop_market(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let _ = (
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            current_timestamp,
+        );
+        Err(BacktestError::InvalidOrderRequest)
+    }
+
+    /// Submits a market-if-touched (MIT) order (server-side trigger). The trigger is evaluated on
+    /// trade events, and once triggered the order becomes an `OrdType::Market` order.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_mit(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let _ = (
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            current_timestamp,
+        );
+        Err(BacktestError::InvalidOrderRequest)
+    }
+
+    /// Submits a stop-limit order (server-side trigger). The trigger is evaluated on trade events.
+    /// Once triggered, the order becomes an `OrdType::Limit` order at `limit_price`.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_stop_limit(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let _ = (
+            order_id,
+            side,
+            trigger_price,
+            limit_price,
+            qty,
+            time_in_force,
+            current_timestamp,
+        );
+        Err(BacktestError::InvalidOrderRequest)
+    }
+
+    /// Modifies a stop-limit order's trigger and limit prices (server-side trigger).
+    fn modify_stop_limit(
+        &mut self,
+        order_id: OrderId,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let _ = (order_id, trigger_price, limit_price, qty, current_timestamp);
+        Err(BacktestError::InvalidOrderRequest)
+    }
 
     /// Modifies an open order.
     ///

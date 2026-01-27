@@ -6,7 +6,7 @@ use crate::{
         assettype::AssetType,
         models::{FeeModel, LatencyModel},
         order::LocalToExch,
-        proc::{LocalProcessor, Processor},
+        proc::{LocalProcessor, Processor, TriggerOrderKind, TriggerOrderParams},
         state::State,
     },
     depth::L3MarketDepth,
@@ -18,6 +18,14 @@ use crate::{
     },
 };
 
+#[derive(Clone, Debug)]
+struct PendingReplaceOrig {
+    price_tick: i64,
+    qty: f64,
+    leaves_qty: f64,
+    trigger_params: Option<TriggerOrderParams>,
+}
+
 /// The Level3 Market-By-Order local model.
 pub struct L3Local<AT, LM, MD, FM>
 where
@@ -27,12 +35,12 @@ where
     FM: FeeModel,
 {
     orders: HashMap<OrderId, Order>,
-    /// Original (price_tick, qty, leaves_qty) snapshot for an in-flight replace request.
+    /// Original order-field snapshot for an in-flight replace request.
     ///
     /// L3Local::modify() pre-mutates the local order to model the local's optimistic view.
     /// If the exchange later rejects the replace (e.g., OrderNotFound), we must restore the
     /// original fields to keep the local order state consistent with the exchange.
-    pending_replace_orig: HashMap<OrderId, (i64, f64, f64)>,
+    pending_replace_orig: HashMap<OrderId, PendingReplaceOrig>,
     order_l2e: LocalToExch<LM>,
     depth: MD,
     state: State<AT, FM>,
@@ -117,6 +125,202 @@ where
         Ok(())
     }
 
+    fn submit_stop_market(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        if self.orders.contains_key(&order_id) {
+            return Err(BacktestError::OrderIdExist);
+        }
+
+        let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
+        let mut order = Order::new(
+            order_id,
+            /* price_tick */ trigger_tick,
+            self.depth.tick_size(),
+            qty,
+            side,
+            OrdType::Market,
+            time_in_force,
+        );
+        order.q = Box::new(TriggerOrderParams {
+            kind: TriggerOrderKind::StopMarket,
+            trigger_tick,
+        });
+        order.req = Status::New;
+        order.local_timestamp = current_timestamp;
+        self.orders.insert(order.order_id, order.clone());
+
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+        order.maker = false;
+        self.order_l2e.request(order, |order| {
+            order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
+        });
+
+        Ok(())
+    }
+
+    fn submit_mit(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        if self.orders.contains_key(&order_id) {
+            return Err(BacktestError::OrderIdExist);
+        }
+
+        let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
+        let mut order = Order::new(
+            order_id,
+            /* price_tick */ trigger_tick,
+            self.depth.tick_size(),
+            qty,
+            side,
+            OrdType::Market,
+            time_in_force,
+        );
+        order.q = Box::new(TriggerOrderParams {
+            kind: TriggerOrderKind::Mit,
+            trigger_tick,
+        });
+        order.req = Status::New;
+        order.local_timestamp = current_timestamp;
+        self.orders.insert(order.order_id, order.clone());
+
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+        order.maker = false;
+        self.order_l2e.request(order, |order| {
+            order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
+        });
+
+        Ok(())
+    }
+
+    fn submit_stop_limit(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        if self.orders.contains_key(&order_id) {
+            return Err(BacktestError::OrderIdExist);
+        }
+
+        let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
+        let limit_tick = (limit_price / self.depth.tick_size()).round() as i64;
+        let mut order = Order::new(
+            order_id,
+            /* price_tick */ limit_tick,
+            self.depth.tick_size(),
+            qty,
+            side,
+            OrdType::Limit,
+            time_in_force,
+        );
+        order.q = Box::new(TriggerOrderParams {
+            kind: TriggerOrderKind::StopLimit,
+            trigger_tick,
+        });
+        order.req = Status::New;
+        order.local_timestamp = current_timestamp;
+        self.orders.insert(order.order_id, order.clone());
+
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+        order.maker = false;
+        self.order_l2e.request(order, |order| {
+            order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
+        });
+
+        Ok(())
+    }
+
+    fn modify_stop_limit(
+        &mut self,
+        order_id: OrderId,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let order = self
+            .orders
+            .get_mut(&order_id)
+            .ok_or(BacktestError::OrderNotFound)?;
+
+        if order.req != Status::None {
+            return Err(BacktestError::OrderRequestInProcess);
+        }
+
+        let params = order
+            .q
+            .as_any()
+            .downcast_ref::<TriggerOrderParams>()
+            .ok_or(BacktestError::InvalidOrderRequest)?;
+        if params.kind != TriggerOrderKind::StopLimit {
+            return Err(BacktestError::InvalidOrderRequest);
+        }
+
+        let orig_params = params.clone();
+        let orig = PendingReplaceOrig {
+            price_tick: order.price_tick,
+            qty: order.qty,
+            leaves_qty: order.leaves_qty,
+            trigger_params: Some(orig_params),
+        };
+        self.pending_replace_orig.insert(order_id, orig);
+
+        let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
+        let limit_tick = (limit_price / self.depth.tick_size()).round() as i64;
+
+        order.price_tick = limit_tick;
+        order.qty = qty;
+        if let Some(params) = order.q.as_any_mut().downcast_mut::<TriggerOrderParams>() {
+            params.trigger_tick = trigger_tick;
+        }
+
+        order.req = Status::Replaced;
+        order.local_timestamp = current_timestamp;
+
+        let mut req_order = order.clone();
+        req_order.exec_qty = 0.0;
+        req_order.exec_price_tick = 0;
+        req_order.maker = false;
+        self.order_l2e.request(req_order, |rej| {
+            rej.req = Status::Rejected;
+            // restore core fields
+            rej.exec_qty = 0.0;
+            rej.exec_price_tick = 0;
+            rej.maker = false;
+        });
+
+        Ok(())
+    }
+
     fn modify(
         &mut self,
         order_id: OrderId,
@@ -136,11 +340,18 @@ where
         // NOTE: The local model optimistically applies the requested price/qty immediately.
         // If the exchange later rejects the replace (e.g., OrderNotFound in a race window),
         // process_recv_order() must restore the original fields from pending_replace_orig.
-        let orig_price_tick = order.price_tick;
-        let orig_qty = order.qty;
-        let orig_leaves_qty = order.leaves_qty;
-        self.pending_replace_orig
-            .insert(order_id, (orig_price_tick, orig_qty, orig_leaves_qty));
+        let orig_params = order
+            .q
+            .as_any()
+            .downcast_ref::<TriggerOrderParams>()
+            .cloned();
+        let orig = PendingReplaceOrig {
+            price_tick: order.price_tick,
+            qty: order.qty,
+            leaves_qty: order.leaves_qty,
+            trigger_params: orig_params,
+        };
+        self.pending_replace_orig.insert(order_id, orig);
 
         let price_tick = (price / self.depth.tick_size()).round() as i64;
         order.price_tick = price_tick;
@@ -155,9 +366,6 @@ where
         req_order.maker = false;
         self.order_l2e.request(req_order, |order| {
             order.req = Status::Rejected;
-            order.price_tick = orig_price_tick;
-            order.qty = orig_qty;
-            order.leaves_qty = orig_leaves_qty;
             order.exec_qty = 0.0;
             order.exec_price_tick = 0;
             order.maker = false;
@@ -330,11 +538,11 @@ where
                                 } else if prev_req == Status::Replaced {
                                     // Exchange-side replace rejects must not apply the attempted
                                     // price/qty to the local order (L3LOCAL-001).
-                                    if let Some((orig_price_tick, orig_qty, orig_leaves_qty)) =
+                                    if let Some(orig) =
                                         self.pending_replace_orig.remove(&order.order_id)
                                     {
-                                        local_order.price_tick = orig_price_tick;
-                                        local_order.qty = orig_qty;
+                                        local_order.price_tick = orig.price_tick;
+                                        local_order.qty = orig.qty;
                                         // If the exchange marks the order inactive on reject
                                         // (CME/Databento MBO policy), keep leaves_qty as provided
                                         // by the response (typically 0).
@@ -342,7 +550,10 @@ where
                                             && local_order.status != Status::Filled
                                             && local_order.status != Status::Canceled
                                         {
-                                            local_order.leaves_qty = orig_leaves_qty;
+                                            local_order.leaves_qty = orig.leaves_qty;
+                                        }
+                                        if let Some(params) = orig.trigger_params {
+                                            local_order.q = Box::new(params);
                                         }
                                     }
                                 }
