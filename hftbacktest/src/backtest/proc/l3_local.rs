@@ -386,13 +386,23 @@ mod tests {
     use crate::{
         backtest::{
             assettype::LinearAsset,
-            models::{CommonFees, ConstantLatency, TradingValueFeeModel},
-            order::order_bus,
-            proc::{LocalProcessor, Processor},
+            models::{CommonFees, ConstantLatency, L3FIFOQueueModel, LatencyModel, TradingValueFeeModel},
+            order::{order_bus, order_bus_with_max_timestamp_reordering},
+            proc::{L3PartialFillExchange, LocalProcessor, Processor},
             state::State,
         },
         depth::HashMapMarketDepth,
-        types::{OrdType, Order, Side, Status, TimeInForce},
+        types::{
+            Event,
+            OrdType,
+            Order,
+            Side,
+            Status,
+            TimeInForce,
+            EXCH_BID_ADD_ORDER_EVENT,
+            EXCH_FILL_EVENT,
+            SELL_EVENT,
+        },
     };
 
     fn make_state() -> State<LinearAsset, TradingValueFeeModel<CommonFees>> {
@@ -404,6 +414,30 @@ mod tests {
 
     fn make_depth() -> HashMapMarketDepth {
         HashMapMarketDepth::new(1.0, 1.0)
+    }
+
+    #[derive(Clone)]
+    struct ResponseLatencyByOrderKind {
+        entry_latency: i64,
+        ack_response_latency: i64,
+        fill_response_latency: i64,
+        reject_response_latency: i64,
+    }
+
+    impl LatencyModel for ResponseLatencyByOrderKind {
+        fn entry(&mut self, _timestamp: i64, _order: &Order) -> i64 {
+            self.entry_latency
+        }
+
+        fn response(&mut self, _timestamp: i64, order: &Order) -> i64 {
+            if order.req == Status::Rejected {
+                return self.reject_response_latency;
+            }
+            if order.status == Status::Filled || order.status == Status::PartiallyFilled {
+                return self.fill_response_latency;
+            }
+            self.ack_response_latency
+        }
     }
 
     #[test]
@@ -669,5 +703,109 @@ mod tests {
         assert_eq!(after_reject.price_tick, 100);
         assert_eq!(after_reject.qty, 1.0);
         assert_eq!(after_reject.leaves_qty, 0.0);
+    }
+
+    #[test]
+    fn cme_mbo_replace_after_exchange_fill_emits_reject_and_rolls_back_local_fields() {
+        // This is a reachability-gated integration repro:
+        // - Exchange-side OrderNotFound reject is produced by the exchange processor (not injected).
+        // - A fill removes the backtest order on the exchange before the replace arrives.
+        // - Response latencies are configured so the replace-reject can arrive before the fill
+        //   notification, which is a CME/MBO race-window scenario.
+        let latency_model = ResponseLatencyByOrderKind {
+            entry_latency: 0,
+            ack_response_latency: 0,
+            fill_response_latency: 100,
+            reject_response_latency: 0,
+        };
+        // Allow order response timestamps to be reordered so the replace-reject can be observed
+        // before the (earlier exchange-time) fill notification.
+        let max_timestamp_reordering = 1_000;
+        let (order_e2l, order_l2e) =
+            order_bus_with_max_timestamp_reordering(latency_model, max_timestamp_reordering);
+
+        let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        )
+        .with_order_not_found_reject_marks_inactive(true);
+
+        let order_id = 1;
+        let px0 = 100.0;
+        let qty0 = 1.0;
+
+        // 1) Submit + ack so the local can send a replace.
+        local
+            .submit_order(
+                order_id,
+                Side::Buy,
+                px0,
+                qty0,
+                OrdType::Limit,
+                TimeInForce::GTC,
+                0,
+            )
+            .unwrap();
+        exch.process_recv_order(0, None).unwrap();
+        local.process_recv_order(0, None).unwrap();
+
+        // 2) Add a market-feed bid order at the same price behind the backtest order.
+        // When that market-feed order is filled, FIFO implies all earlier orders at that price
+        // (including our backtest order) are filled first.
+        let mkt_bid_order_id = 2;
+        exch.process(&Event {
+            ev: EXCH_BID_ADD_ORDER_EVENT,
+            exch_ts: 1,
+            local_ts: 0,
+            px: px0,
+            qty: 1.0,
+            order_id: mkt_bid_order_id,
+            ival: 0,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // 3) Exchange fill removes the backtest order before the replace arrives.
+        // (Fill notification to local is delayed by fill_response_latency.)
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 2,
+            local_ts: 0,
+            px: px0,
+            qty: 1.0,
+            order_id: mkt_bid_order_id,
+            ival: 0,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // 4) Local sends a replace after the order is already gone on the exchange.
+        // This pre-mutates local price/qty optimistically.
+        local.modify(order_id, 101.0, 2.0, 3).unwrap();
+        assert_eq!(local.orders().get(&order_id).unwrap().price_tick, 101);
+        assert_eq!(local.orders().get(&order_id).unwrap().qty, 2.0);
+
+        // 5) Exchange processes replace: OrderNotFound => reject (CME/MBO policy marks inactive).
+        exch.process_recv_order(3, None).unwrap();
+        local.process_recv_order(3, None).unwrap();
+
+        // Local must roll back attempted price/qty, and must not resurrect leaves_qty if the
+        // reject marked the order inactive.
+        let after_reject = local.orders().get(&order_id).unwrap();
+        assert_eq!(after_reject.req, Status::None);
+        assert_eq!(after_reject.status, Status::Expired);
+        assert_eq!(after_reject.price_tick, 100);
+        assert_eq!(after_reject.qty, 1.0);
+        assert_eq!(after_reject.leaves_qty, 0.0);
+
+        // 6) Later, the delayed fill notification arrives; it should not reintroduce the attempted
+        // replace fields.
+        local.process_recv_order(102, None).unwrap();
+        let after_fill = local.orders().get(&order_id).unwrap();
+        assert_eq!(after_fill.price_tick, 100);
+        assert_eq!(after_fill.qty, 1.0);
     }
 }
