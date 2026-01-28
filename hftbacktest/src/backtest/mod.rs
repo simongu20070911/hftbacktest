@@ -65,6 +65,40 @@ pub mod recorder;
 pub mod data;
 mod evs;
 
+/// Policy for ordering exchange order-receipt events (ExchOrder) vs exchange market-data events
+/// (ExchData) when their timestamps are equal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchOrderEqualTsPolicy {
+    /// Process ExchOrder before ExchData when timestamps are equal (conservative anti-lookahead
+    /// policy; this matches the historical default behavior).
+    BeforeExchData,
+    /// Process ExchOrder after ExchData when timestamps are equal (pessimistic; avoids stale-book
+    /// optimistic fills when the feed contains same-timestamp cancels/modifies).
+    AfterExchData,
+    /// Randomly choose Before/After for each equal-timestamp tie, using a deterministic seed.
+    RandomSeeded { seed: u64 },
+}
+
+#[derive(Clone, Copy)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // SplitMix64: simple, fast, deterministic; good enough for tie-breaking.
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+}
+
 /// Errors that can occur during backtesting.
 #[derive(Error, Debug)]
 pub enum BacktestError {
@@ -89,6 +123,11 @@ pub struct Asset<L: ?Sized, E: ?Sized, D: NpyDTyped + Clone /* todo: ugly bounds
     pub local: Box<L>,
     pub exch: Box<E>,
     pub reader: Reader<D>,
+    /// Whether the scheduler should use `(timestamp, seq)` tie-breaking for this asset.
+    ///
+    /// This is intended for CME via Databento MBO, where `Event.ival` is populated with Databento
+    /// `sequence` values.
+    pub use_seq_tie_break: bool,
 }
 
 impl<L, E, D: NpyDTyped + Clone> Asset<L, E, D> {
@@ -99,6 +138,7 @@ impl<L, E, D: NpyDTyped + Clone> Asset<L, E, D> {
             local: Box::new(local),
             exch: Box::new(exch),
             reader,
+            use_seq_tie_break: false,
         }
     }
 
@@ -344,6 +384,7 @@ where
                     local: Box::new(local),
                     exch: Box::new(exch),
                     reader,
+                    use_seq_tie_break: false,
                 })
             }
             ExchangeKind::PartialFillExchange => {
@@ -358,6 +399,7 @@ where
                     local: Box::new(local),
                     exch: Box::new(exch),
                     reader,
+                    use_seq_tie_break: false,
                 })
             }
         }
@@ -624,6 +666,7 @@ where
                     local: Box::new(local),
                     exch: Box::new(exch),
                     reader,
+                    use_seq_tie_break: false,
                 })
             }
             ExchangeKind::PartialFillExchange => {
@@ -647,6 +690,7 @@ where
                     local: Box::new(local),
                     exch: Box::new(exch),
                     reader,
+                    use_seq_tie_break: true,
                 })
             }
         }
@@ -671,12 +715,15 @@ where
 pub struct BacktestBuilder<MD> {
     local: Vec<BacktestProcessorState<Box<dyn LocalProcessor<MD>>>>,
     exch: Vec<BacktestProcessorState<Box<dyn Processor>>>,
+    exch_order_equal_ts_policy: ExchOrderEqualTsPolicy,
+    use_seq_tie_break: bool,
 }
 
 impl<MD> BacktestBuilder<MD> {
     /// Adds [`Asset`], which will undergo simulation within the backtester.
     pub fn add_asset(self, asset: Asset<dyn LocalProcessor<MD>, dyn Processor, Event>) -> Self {
         let mut self_ = Self { ..self };
+        self_.use_seq_tie_break |= asset.use_seq_tie_break;
         self_.local.push(BacktestProcessorState::new(
             asset.local,
             asset.reader.clone(),
@@ -684,6 +731,14 @@ impl<MD> BacktestBuilder<MD> {
         self_
             .exch
             .push(BacktestProcessorState::new(asset.exch, asset.reader));
+        self_
+    }
+
+    /// Sets the ordering policy for exchange order receipts vs exchange market data at equal
+    /// timestamps.
+    pub fn exch_order_equal_ts_policy(self, policy: ExchOrderEqualTsPolicy) -> Self {
+        let mut self_ = Self { ..self };
+        self_.exch_order_equal_ts_policy = policy;
         self_
     }
 
@@ -695,9 +750,16 @@ impl<MD> BacktestBuilder<MD> {
         }
         Ok(Backtest {
             cur_ts: i64::MAX,
-            evs: EventSet::new(num_assets),
+            evs: EventSet::new(num_assets, self.use_seq_tie_break),
             local: self.local,
             exch: self.exch,
+            exch_order_equal_ts_policy: self.exch_order_equal_ts_policy,
+            exch_order_equal_ts_rng: match self.exch_order_equal_ts_policy {
+                ExchOrderEqualTsPolicy::RandomSeeded { seed } => Some(SplitMix64::new(seed)),
+                _ => None,
+            },
+            exch_order_equal_ts_random_tie_ts: vec![i64::MIN; num_assets],
+            exch_order_equal_ts_random_tie_seq: vec![i64::MIN; num_assets],
         })
     }
 }
@@ -710,6 +772,10 @@ pub struct Backtest<MD> {
     evs: EventSet,
     local: Vec<BacktestProcessorState<Box<dyn LocalProcessor<MD>>>>,
     exch: Vec<BacktestProcessorState<Box<dyn Processor>>>,
+    exch_order_equal_ts_policy: ExchOrderEqualTsPolicy,
+    exch_order_equal_ts_rng: Option<SplitMix64>,
+    exch_order_equal_ts_random_tie_ts: Vec<i64>,
+    exch_order_equal_ts_random_tie_seq: Vec<i64>,
 }
 
 impl<P: Processor> Deref for BacktestProcessorState<P> {
@@ -779,6 +845,14 @@ impl<P: Processor> BacktestProcessorState<P> {
             self.row = None;
         }
     }
+
+    #[inline]
+    fn current_event_seq(&self) -> i64 {
+        match self.row {
+            Some(rn) => self.data[rn].ival,
+            None => i64::MAX,
+        }
+    }
 }
 
 impl<MD> Backtest<MD>
@@ -789,6 +863,8 @@ where
         BacktestBuilder {
             local: vec![],
             exch: vec![],
+            exch_order_equal_ts_policy: ExchOrderEqualTsPolicy::BeforeExchData,
+            use_seq_tie_break: false,
         }
     }
 
@@ -817,14 +893,79 @@ where
             local,
             exch,
             cur_ts: i64::MAX,
-            evs: EventSet::new(num_assets),
+            evs: EventSet::new(num_assets, false),
+            exch_order_equal_ts_policy: ExchOrderEqualTsPolicy::BeforeExchData,
+            exch_order_equal_ts_rng: None,
+            exch_order_equal_ts_random_tie_ts: vec![i64::MIN; num_assets],
+            exch_order_equal_ts_random_tie_seq: vec![i64::MIN; num_assets],
         }
+    }
+
+    #[inline]
+    fn compute_exch_order_seq(
+        policy: ExchOrderEqualTsPolicy,
+        rng: &mut Option<SplitMix64>,
+        random_tie_ts: &mut [i64],
+        random_tie_seq: &mut [i64],
+        asset_no: usize,
+        order_ts: i64,
+        exch_data_ts: i64,
+    ) -> i64 {
+        if order_ts == i64::MAX {
+            if matches!(policy, ExchOrderEqualTsPolicy::RandomSeeded { .. }) {
+                random_tie_ts[asset_no] = i64::MIN;
+            }
+            return i64::MAX;
+        }
+        match policy {
+            ExchOrderEqualTsPolicy::BeforeExchData => i64::MIN,
+            ExchOrderEqualTsPolicy::AfterExchData => i64::MAX,
+            ExchOrderEqualTsPolicy::RandomSeeded { .. } => {
+                if order_ts != exch_data_ts {
+                    random_tie_ts[asset_no] = i64::MIN;
+                    i64::MIN
+                } else {
+                    if random_tie_ts[asset_no] == order_ts {
+                        return random_tie_seq[asset_no];
+                    }
+                    let rng = rng.as_mut().expect("RandomSeeded policy requires rng");
+                    let seq = if (rng.next_u64() & 1) == 0 { i64::MIN } else { i64::MAX };
+                    random_tie_ts[asset_no] = order_ts;
+                    random_tie_seq[asset_no] = seq;
+                    seq
+                }
+            }
+        }
+    }
+
+    fn sync_exch_order_seq_for_asset(&mut self, asset_no: usize) {
+        if !matches!(
+            self.exch_order_equal_ts_policy,
+            ExchOrderEqualTsPolicy::RandomSeeded { .. }
+        ) {
+            return;
+        }
+
+        let order_ts = self.evs.peek_exch_order_timestamp(asset_no);
+        let exch_data_ts = self.evs.peek_exch_data_timestamp(asset_no);
+        let seq = Self::compute_exch_order_seq(
+            self.exch_order_equal_ts_policy,
+            &mut self.exch_order_equal_ts_rng,
+            &mut self.exch_order_equal_ts_random_tie_ts,
+            &mut self.exch_order_equal_ts_random_tie_seq,
+            asset_no,
+            order_ts,
+            exch_data_ts,
+        );
+        self.evs.update_exch_order(asset_no, order_ts, seq);
     }
 
     fn initialize_evs(&mut self) -> Result<(), BacktestError> {
         for (asset_no, local) in self.local.iter_mut().enumerate() {
             match local.advance() {
-                Ok(ts) => self.evs.update_local_data(asset_no, ts),
+                Ok(ts) => self
+                    .evs
+                    .update_local_data(asset_no, ts, local.current_event_seq()),
                 Err(BacktestError::EndOfData) => {
                     self.evs.invalidate_local_data(asset_no);
                 }
@@ -835,7 +976,9 @@ where
         }
         for (asset_no, exch) in self.exch.iter_mut().enumerate() {
             match exch.advance() {
-                Ok(ts) => self.evs.update_exch_data(asset_no, ts),
+                Ok(ts) => self
+                    .evs
+                    .update_exch_data(asset_no, ts, exch.current_event_seq()),
                 Err(BacktestError::EndOfData) => {
                     self.evs.invalidate_exch_data(asset_no);
                 }
@@ -870,11 +1013,24 @@ where
         let mut result = ElapseResult::Ok;
         let mut timestamp = timestamp;
         let mut last_event_timestamp: Option<i64> = None;
-        for (asset_no, local) in self.local.iter().enumerate() {
+        for asset_no in 0..self.local.len() {
+            let exch_data_ts = self.evs.peek_exch_data_timestamp(asset_no);
+            let local_send_ts = self.local[asset_no].earliest_send_order_timestamp();
+            let local_recv_ts = self.local[asset_no].earliest_recv_order_timestamp();
+            let exch_order_seq = Self::compute_exch_order_seq(
+                self.exch_order_equal_ts_policy,
+                &mut self.exch_order_equal_ts_rng,
+                &mut self.exch_order_equal_ts_random_tie_ts,
+                &mut self.exch_order_equal_ts_random_tie_seq,
+                asset_no,
+                local_send_ts,
+                exch_data_ts,
+            );
+
             self.evs
-                .update_exch_order(asset_no, local.earliest_send_order_timestamp());
+                .update_exch_order(asset_no, local_send_ts, exch_order_seq);
             self.evs
-                .update_local_order(asset_no, local.earliest_recv_order_timestamp());
+                .update_local_order(asset_no, local_recv_ts, i64::MAX);
         }
         loop {
             match self.evs.next() {
@@ -894,7 +1050,11 @@ where
 
                             match next {
                                 Ok(next_ts) => {
-                                    self.evs.update_local_data(ev.asset_no, next_ts);
+                                    self.evs.update_local_data(
+                                        ev.asset_no,
+                                        next_ts,
+                                        local.current_event_seq(),
+                                    );
                                 }
                                 Err(BacktestError::EndOfData) => {
                                     self.evs.invalidate_local_data(ev.asset_no);
@@ -928,18 +1088,22 @@ where
                             self.evs.update_local_order(
                                 ev.asset_no,
                                 local.earliest_recv_order_timestamp(),
+                                i64::MAX,
                             );
                         }
                         EventIntentKind::ExchData => {
-                            let exch = unsafe { self.exch.get_unchecked_mut(ev.asset_no) };
-                            let next = exch.next_row().and_then(|row| {
-                                exch.processor.process(&exch.data[row])?;
-                                exch.advance()
-                            });
+                            let (next, next_seq, local_order_ts) = {
+                                let exch = unsafe { self.exch.get_unchecked_mut(ev.asset_no) };
+                                let next = exch.next_row().and_then(|row| {
+                                    exch.processor.process(&exch.data[row])?;
+                                    exch.advance()
+                                });
+                                (next, exch.current_event_seq(), exch.earliest_send_order_timestamp())
+                            };
 
                             match next {
                                 Ok(next_ts) => {
-                                    self.evs.update_exch_data(ev.asset_no, next_ts);
+                                    self.evs.update_exch_data(ev.asset_no, next_ts, next_seq);
                                 }
                                 Err(BacktestError::EndOfData) => {
                                     self.evs.invalidate_exch_data(ev.asset_no);
@@ -948,22 +1112,33 @@ where
                                     return Err(e);
                                 }
                             }
-                            self.evs.update_local_order(
-                                ev.asset_no,
-                                exch.earliest_send_order_timestamp(),
-                            );
+                            // Under RandomSeeded, the ExchOrder vs ExchData decision must be made
+                            // when the timestamps actually tie, which may happen only after ExchData
+                            // advances.
+                            self.sync_exch_order_seq_for_asset(ev.asset_no);
+
+                            self.evs
+                                .update_local_order(ev.asset_no, local_order_ts, i64::MAX);
                         }
                         EventIntentKind::ExchOrder => {
-                            let exch = unsafe { self.exch.get_unchecked_mut(ev.asset_no) };
-                            let _ = exch.process_recv_order(ev.timestamp, None)?;
-                            self.evs.update_exch_order(
+                            let (exch_order_ts, local_order_ts) = {
+                                let exch = unsafe { self.exch.get_unchecked_mut(ev.asset_no) };
+                                let _ = exch.process_recv_order(ev.timestamp, None)?;
+                                (exch.earliest_recv_order_timestamp(), exch.earliest_send_order_timestamp())
+                            };
+                            let exch_data_ts = self.evs.peek_exch_data_timestamp(ev.asset_no);
+                            let exch_order_seq = Self::compute_exch_order_seq(
+                                self.exch_order_equal_ts_policy,
+                                &mut self.exch_order_equal_ts_rng,
+                                &mut self.exch_order_equal_ts_random_tie_ts,
+                                &mut self.exch_order_equal_ts_random_tie_seq,
                                 ev.asset_no,
-                                exch.earliest_recv_order_timestamp(),
+                                exch_order_ts,
+                                exch_data_ts,
                             );
-                            self.evs.update_local_order(
-                                ev.asset_no,
-                                exch.earliest_send_order_timestamp(),
-                            );
+                            self.evs.update_exch_order(ev.asset_no, exch_order_ts, exch_order_seq);
+                            self.evs
+                                .update_local_order(ev.asset_no, local_order_ts, i64::MAX);
                         }
                     }
                 }
@@ -1292,7 +1467,7 @@ mod test {
     use std::error::Error;
     use std::io::ErrorKind;
 
-    use super::evs::{EventIntentKind, EventSet};
+    use super::{ExchOrderEqualTsPolicy, evs::{EventIntentKind, EventSet}};
     use crate::{
         backtest::{
             Backtest,
@@ -1699,10 +1874,10 @@ mod test {
     }
 
     #[test]
-    fn eventset_tie_breaks_exch_order_before_exch_data() {
-        let mut evs = EventSet::new(1);
-        evs.update_exch_data(0, 1);
-        evs.update_exch_order(0, 1);
+    fn eventset_tie_breaks_by_seq_within_timestamp() {
+        let mut evs = EventSet::new(1, false);
+        evs.update_exch_data(0, 1, 10);
+        evs.update_exch_order(0, 1, 0);
 
         let ev = evs.next().expect("expected an event");
         assert_eq!(ev.timestamp, 1);
@@ -1715,7 +1890,7 @@ mod test {
         // If exchange market data (book update) is processed before an order receipt event at the
         // same exchange timestamp, order acceptance/fills can read a post-update book state at that
         // timestamp (within-timestamp look-ahead). This regression test asserts a conservative
-        // ordering: ExchOrder precedes ExchData when timestamps are equal.
+        // ordering: ExchOrder precedes ExchData when timestamps are equal (the default policy).
         let data = Data::from_data(&[
             Event {
                 ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
@@ -1775,6 +1950,238 @@ mod test {
         assert!(order.maker, "expected maker fill (no same-ts look-ahead)");
         assert_eq!(order.exec_price_tick, 100);
         Ok(())
+    }
+
+    #[test]
+    fn exch_order_is_processed_after_exch_data_at_same_timestamp() -> Result<(), Box<dyn Error>> {
+        // With `AfterExchData`, an order arriving exactly at the same exchange timestamp as a book
+        // update will be processed after the update (pessimistic tie policy).
+        let data = Data::from_data(&[
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 1,
+                local_ts: 1,
+                px: 99.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset({
+                let mut asset = L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    // Order sent at local_ts=0 arrives at exch_ts=1.
+                    .latency_model(ConstantLatency::new(1, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?;
+                // Enable `(timestamp, seq)` tie-breaking so `ExchOrderEqualTsPolicy` is active.
+                asset.use_seq_tie_break = true;
+                asset
+            })
+            .exch_order_equal_ts_policy(ExchOrderEqualTsPolicy::AfterExchData)
+            .build()?;
+
+        // Seed exchange depth at exch_ts=0 with best ask=101.
+        backtester.elapse_bt(0)?;
+
+        // With the pessimistic ordering, the order sees the post-update ask=99 when it arrives at
+        // exch_ts=1 and becomes taker at 99.
+        backtester.submit_buy_order(
+            0,
+            1,
+            100.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        let order = backtester.orders(0).get(&1).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert!(!order.maker, "expected taker fill under AfterExchData");
+        assert_eq!(order.exec_price_tick, 99);
+        Ok(())
+    }
+
+    #[test]
+    fn exch_order_equal_ts_policy_random_seeded_is_deterministic(
+    ) -> Result<(), Box<dyn Error>> {
+        // Choose a seed whose first SplitMix64 output selects the AfterExchData branch, so this
+        // test fails if RandomSeeded silently degenerates to BeforeExchData.
+        let seed = 1;
+        let mut rng = super::SplitMix64::new(seed);
+        let before = (rng.next_u64() & 1) == 0;
+
+        let data = Data::from_data(&[
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 0,
+                local_ts: 0,
+                px: 101.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+            Event {
+                ev: EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+                exch_ts: 1,
+                local_ts: 1,
+                px: 99.0,
+                qty: 1.0,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset({
+                let mut asset = L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(data)])
+                    // Order sent at local_ts=0 arrives at exch_ts=1.
+                    .latency_model(ConstantLatency::new(1, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?;
+                // Enable `(timestamp, seq)` tie-breaking so `ExchOrderEqualTsPolicy` is active.
+                asset.use_seq_tie_break = true;
+                asset
+            })
+            .exch_order_equal_ts_policy(ExchOrderEqualTsPolicy::RandomSeeded { seed })
+            .build()?;
+
+        backtester.elapse_bt(0)?;
+
+        backtester.submit_buy_order(
+            0,
+            1,
+            100.0,
+            1.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            true,
+        )?;
+
+        let order = backtester.orders(0).get(&1).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        if before {
+            assert!(
+                order.maker,
+                "expected maker fill under RandomSeeded (BeforeExchData branch)"
+            );
+            assert_eq!(order.exec_price_tick, 100);
+        } else {
+            assert!(
+                !order.maker,
+                "expected taker fill under RandomSeeded (AfterExchData branch)"
+            );
+            assert_eq!(order.exec_price_tick, 99);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug-only trace dump; run manually with `cargo test -- --ignored --nocapture`"]
+    fn exch_order_equal_ts_policy_tie_break_trace_dump() {
+        fn kind_str(kind: EventIntentKind) -> &'static str {
+            match kind {
+                EventIntentKind::LocalData => "LocalData",
+                EventIntentKind::LocalOrder => "LocalOrder",
+                EventIntentKind::ExchOrder => "ExchOrder",
+                EventIntentKind::ExchData => "ExchData",
+            }
+        }
+
+        fn dump(label: &str, evs: &EventSet) {
+            let (ld_ts, ld_seq) = evs.debug_slot(0, EventIntentKind::LocalData);
+            let (lo_ts, lo_seq) = evs.debug_slot(0, EventIntentKind::LocalOrder);
+            let (eo_ts, eo_seq) = evs.debug_slot(0, EventIntentKind::ExchOrder);
+            let (ed_ts, ed_seq) = evs.debug_slot(0, EventIntentKind::ExchData);
+            println!(
+                "{label}: LD=({ld_ts},{ld_seq}) LO=({lo_ts},{lo_seq}) EO=({eo_ts},{eo_seq}) ED=({ed_ts},{ed_seq})"
+            );
+        }
+
+        fn run_case(label: &str, policy: ExchOrderEqualTsPolicy) {
+            let mut evs = EventSet::new(1, true);
+            // Disable other streams.
+            evs.update_local_data(0, i64::MAX, i64::MAX);
+            evs.update_local_order(0, i64::MAX, i64::MAX);
+
+            // A deterministic "order arrives at 100, feed currently at 50 then advances to 100"
+            // shape. This is the case where RandomSeeded used to silently degenerate to
+            // BeforeExchData (because the tie only appears after ExchData advances).
+            let order_ts = 100;
+            let mut rng = match policy {
+                ExchOrderEqualTsPolicy::RandomSeeded { seed } => Some(super::SplitMix64::new(seed)),
+                _ => None,
+            };
+            let mut random_tie_ts = vec![i64::MIN; 1];
+            let mut random_tie_seq = vec![i64::MIN; 1];
+
+            // Stage 1: ExchData is at 50, so there is no tie yet.
+            evs.update_exch_data(0, 50, 1);
+            let eo_seq = Backtest::<HashMapMarketDepth>::compute_exch_order_seq(
+                policy,
+                &mut rng,
+                &mut random_tie_ts,
+                &mut random_tie_seq,
+                0,
+                order_ts,
+                50,
+            );
+            evs.update_exch_order(0, order_ts, eo_seq);
+
+            dump(&format!("{label}/stage1"), &evs);
+            let next = evs.next().expect("expected a next event");
+            println!("{label}/stage1 next = {} @ {}", kind_str(next.kind), next.timestamp);
+
+            // Stage 2: ExchData advances to 100, which creates the exact-ns tie.
+            evs.update_exch_data(0, 100, 2);
+            let eo_seq = Backtest::<HashMapMarketDepth>::compute_exch_order_seq(
+                policy,
+                &mut rng,
+                &mut random_tie_ts,
+                &mut random_tie_seq,
+                0,
+                order_ts,
+                100,
+            );
+            evs.update_exch_order(0, order_ts, eo_seq);
+
+            dump(&format!("{label}/stage2"), &evs);
+            let next = evs.next().expect("expected a next event");
+            println!("{label}/stage2 next = {} @ {}", kind_str(next.kind), next.timestamp);
+        }
+
+        run_case("BeforeExchData", ExchOrderEqualTsPolicy::BeforeExchData);
+        run_case("AfterExchData", ExchOrderEqualTsPolicy::AfterExchData);
+        // Seed chosen so the first SplitMix64 sample selects the AfterExchData branch.
+        run_case(
+            "RandomSeeded(seed=1)",
+            ExchOrderEqualTsPolicy::RandomSeeded { seed: 1 },
+        );
     }
 
     #[test]
