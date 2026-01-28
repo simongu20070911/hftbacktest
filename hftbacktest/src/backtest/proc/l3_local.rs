@@ -292,6 +292,15 @@ where
             return Err(BacktestError::OrderRequestInProcess);
         }
 
+        // Stop-Limit has two distinct prices (trigger + post-trigger limit), so the generic
+        // `modify(order_id, price, qty)` API is ambiguous. Force callers to use
+        // `modify_stop_limit(order_id, trigger_price, limit_price, qty)` instead.
+        if let Some(params) = order.q.as_any().downcast_ref::<TriggerOrderParams>()
+            && params.kind == TriggerOrderKind::StopLimit
+        {
+            return Err(BacktestError::InvalidOrderRequest);
+        }
+
         // NOTE: The local model optimistically applies the requested price/qty immediately.
         // If the exchange later rejects the replace (e.g., OrderNotFound in a race window),
         // process_recv_order() must restore the original fields from pending_replace_orig.
@@ -318,9 +327,7 @@ where
                     // For Stop-Market and MIT, `modify(price, qty)` means modifying the trigger.
                     params.trigger_tick = price_tick;
                 }
-                TriggerOrderKind::StopLimit => {
-                    // For Stop-Limit, `modify(price, qty)` modifies the post-trigger limit price.
-                }
+                TriggerOrderKind::StopLimit => {}
             }
         }
 
@@ -563,12 +570,13 @@ where
 mod tests {
     use crate::{
         backtest::{
+            BacktestError,
             assettype::LinearAsset,
             models::{
                 CommonFees, ConstantLatency, L3FIFOQueueModel, LatencyModel, TradingValueFeeModel,
             },
             order::{order_bus, order_bus_with_max_timestamp_reordering},
-            proc::{L3PartialFillExchange, LocalProcessor, Processor},
+            proc::{L3PartialFillExchange, LocalProcessor, Processor, TriggerOrderParams},
             state::State,
         },
         depth::HashMapMarketDepth,
@@ -798,6 +806,47 @@ mod tests {
         assert_eq!(after_reject.price_tick, 100);
         assert_eq!(after_reject.qty, 1.0);
         assert_eq!(after_reject.leaves_qty, 1.0);
+    }
+
+    #[test]
+    fn stop_limit_modify_via_generic_modify_is_rejected() {
+        let entry_latency = 0;
+        let resp_latency = 0;
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(entry_latency, resp_latency));
+
+        let mut local = super::L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        );
+
+        let order_id = 1;
+
+        local
+            .submit_stop_limit(
+                order_id,
+                Side::Buy,
+                /* trigger */ 104.0,
+                /* limit */ 99.0,
+                /* qty */ 1.0,
+                TimeInForce::GTC,
+                /* now */ 0,
+            )
+            .unwrap();
+        exch.process_recv_order(0, None).unwrap();
+        local.process_recv_order(0, None).unwrap();
+
+        let res = local.modify(order_id, /* price */ 100.0, /* qty */ 2.0, /* now */ 1);
+        assert!(matches!(res, Err(BacktestError::InvalidOrderRequest)));
+
+        let ord = local.orders().get(&order_id).unwrap();
+        assert_eq!(ord.price_tick, 99);
+        assert_eq!(ord.qty, 1.0);
+        let params = ord.q.as_any().downcast_ref::<TriggerOrderParams>().unwrap();
+        assert_eq!(params.trigger_tick, 104);
     }
 
     #[test]

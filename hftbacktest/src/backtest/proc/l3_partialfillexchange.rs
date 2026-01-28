@@ -32,21 +32,13 @@ struct HeldTriggerOrder {
     params: TriggerOrderParams,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingTriggerGroupKey {
-    /// A vendor-provided “batch/packet” id (Databento `sequence`) that can span multiple exchange
-    /// timestamps while sharing the same local receive timestamp.
+struct PendingTriggerBucket {
+    /// The exchange timestamp bucket that triggered these orders.
     ///
-    /// When available, it provides a stronger boundary than `(exch_ts, local_ts)` for preventing
-    /// stop/MIT activation from participating in executions that belong to the same batch.
-    BatchId { local_ts: i64, batch_id: i64 },
-    /// Fallback boundary when a batch id isn't available.
-    Timestamps { exch_ts: i64, local_ts: i64 },
-}
-
-struct PendingTriggerGroup {
-    key: PendingTriggerGroupKey,
-    max_exch_ts: i64,
+    /// Triggered stop/MIT orders are activated only after we advance to a different `exch_ts`
+    /// (i.e., after leaving this timestamp bucket), so they cannot participate in any executions
+    /// that share the triggering trade's `exch_ts`.
+    exch_ts: i64,
     orders: Vec<HeldTriggerOrder>,
 }
 
@@ -64,7 +56,7 @@ where
     order_e2l: ExchToLocal<LM>,
     order_not_found_reject_marks_inactive: bool,
     trigger_orders: HashMap<OrderId, HeldTriggerOrder>,
-    pending_trigger_group: Option<PendingTriggerGroup>,
+    pending_trigger_bucket: Option<PendingTriggerBucket>,
 }
 
 impl<AT, LM, QM, MD, FM> L3PartialFillExchange<AT, LM, QM, MD, FM>
@@ -89,7 +81,7 @@ where
             order_e2l,
             order_not_found_reject_marks_inactive: false,
             trigger_orders: HashMap::new(),
-            pending_trigger_group: None,
+            pending_trigger_bucket: None,
         }
     }
 
@@ -142,26 +134,8 @@ where
         }
     }
 
-    fn trigger_group_key(event: &Event) -> PendingTriggerGroupKey {
-        // Backward-compatibility heuristic:
-        // - Older Databento converters stored `flags` in `Event.ival` (typically small integers).
-        // - For CME MBO, the vendor `sequence` values are large (tens of millions in the sample).
-        let batch_id = (event.ival >= 1_000_000).then_some(event.ival);
-        if let Some(batch_id) = batch_id {
-            PendingTriggerGroupKey::BatchId {
-                local_ts: event.local_ts,
-                batch_id,
-            }
-        } else {
-            PendingTriggerGroupKey::Timestamps {
-                exch_ts: event.exch_ts,
-                local_ts: event.local_ts,
-            }
-        }
-    }
-
-    fn flush_pending_trigger_group(&mut self) -> Result<(), BacktestError> {
-        let Some(pending) = self.pending_trigger_group.take() else {
+    fn flush_pending_trigger_bucket(&mut self, activation_ts: i64) -> Result<(), BacktestError> {
+        let Some(pending) = self.pending_trigger_bucket.take() else {
             return Ok(());
         };
 
@@ -178,8 +152,8 @@ where
                 }
             }
 
-            // Activation is deferred until after the entire batch/group is processed.
-            self.ack_new(&mut child, pending.max_exch_ts)?;
+            // Activation is deferred until after we leave the triggering `exch_ts` bucket.
+            self.ack_new(&mut child, activation_ts)?;
 
             self.order_e2l.respond(child);
         }
@@ -540,18 +514,15 @@ where
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
-        // If we deferred trigger activation waiting for the end of the current batch/group, flush
-        // as soon as we advance to a different boundary key.
-        let key = Self::trigger_group_key(event);
-        if let Some(pending) = &self.pending_trigger_group
-            && pending.key != key
-        {
-            self.flush_pending_trigger_group()?;
-        }
-        if let Some(pending) = &mut self.pending_trigger_group
-            && pending.key == key
-        {
-            pending.max_exch_ts = pending.max_exch_ts.max(event.exch_ts);
+        // If we deferred trigger activation waiting for the end of the triggering trade's
+        // `exch_ts` bucket, flush as soon as we advance to a different `exch_ts`.
+        let should_flush_pending = self
+            .pending_trigger_bucket
+            .as_ref()
+            .map(|pending| event.exch_ts > pending.exch_ts)
+            .unwrap_or(false);
+        if should_flush_pending {
+            self.flush_pending_trigger_bucket(event.exch_ts)?;
         }
 
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
@@ -608,13 +579,12 @@ where
 
             if !triggered_ids.is_empty() {
                 let pending = self
-                    .pending_trigger_group
-                    .get_or_insert(PendingTriggerGroup {
-                        key,
-                        max_exch_ts: event.exch_ts,
+                    .pending_trigger_bucket
+                    .get_or_insert(PendingTriggerBucket {
+                        exch_ts: event.exch_ts,
                         orders: Vec::new(),
                     });
-                debug_assert_eq!(pending.key, key);
+                debug_assert_eq!(pending.exch_ts, event.exch_ts);
                 for order_id in triggered_ids {
                     let held = self.trigger_orders.remove(&order_id).unwrap();
                     pending.orders.push(held);
@@ -643,6 +613,17 @@ where
         timestamp: i64,
         _wait_resp_order_id: Option<OrderId>,
     ) -> Result<bool, BacktestError> {
+        // Ensure pending triggers don't get "stuck" if the next thing we process on the exchange
+        // is an order request rather than another exchange data event.
+        let should_flush_pending = self
+            .pending_trigger_bucket
+            .as_ref()
+            .map(|pending| timestamp > pending.exch_ts)
+            .unwrap_or(false);
+        if should_flush_pending {
+            self.flush_pending_trigger_bucket(timestamp)?;
+        }
+
         while let Some(mut order) = self.order_e2l.receive(timestamp) {
             if order.req == Status::New {
                 order.req = Status::None;
@@ -709,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_market_triggers_after_batch_boundary() {
+    fn stop_market_triggers_after_exch_ts_bucket() {
         let (order_e2l, order_l2e) =
             order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
@@ -751,8 +732,9 @@ mod tests {
         local.process_recv_order(0, None).unwrap();
         assert_eq!(local.orders().get(&order_id).unwrap().status, Status::New);
 
-        // Trade triggers the stop, but activation must be deferred until the end of the Databento
-        // batch/group so it cannot participate in any executions that belong to the same batch.
+        // Trade triggers the stop, but activation must be deferred until we leave the triggering
+        // trade's `exch_ts` bucket so it cannot participate in executions that share that
+        // timestamp.
         exch.process(&Event {
             ev: EXCH_TRADE_EVENT | BUY_EVENT,
             exch_ts: 10,
@@ -767,8 +749,9 @@ mod tests {
         local.process_recv_order(10, None).unwrap();
         assert_eq!(local.orders().get(&order_id).unwrap().exec_qty, 0.0);
 
-        // Multiple fill records can belong to the same triggering batch (including across
-        // different exchange timestamps while sharing the same local receive time).
+        // Multiple records can share the same local receive time (Databento packet), but the stop
+        // should activate as soon as exchange time advances past the trigger bucket (even if the
+        // packet/sequence is unchanged).
         exch.process(&Event {
             ev: EXCH_FILL_EVENT | SELL_EVENT,
             exch_ts: 10,
@@ -780,6 +763,9 @@ mod tests {
             fval: 0.0,
         })
         .unwrap();
+        local.process_recv_order(10, None).unwrap();
+        assert_eq!(local.orders().get(&order_id).unwrap().exec_qty, 0.0);
+
         exch.process(&Event {
             ev: EXCH_FILL_EVENT | SELL_EVENT,
             exch_ts: 11,
@@ -788,23 +774,6 @@ mod tests {
             qty: 1.0,
             order_id: mkt_ask_order_id,
             ival: 1_000_002,
-            fval: 0.0,
-        })
-        .unwrap();
-
-        // Still not activated mid-batch.
-        local.process_recv_order(11, None).unwrap();
-        assert_eq!(local.orders().get(&order_id).unwrap().exec_qty, 0.0);
-
-        // Advance to the next batch/group to flush pending triggers.
-        exch.process(&Event {
-            ev: EXCH_EVENT,
-            exch_ts: 12,
-            local_ts: 100,
-            px: 0.0,
-            qty: 0.0,
-            order_id: 0,
-            ival: 1_000_003,
             fval: 0.0,
         })
         .unwrap();
@@ -871,7 +840,7 @@ mod tests {
         local.process_recv_order(5, None).unwrap();
         assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
 
-        // Trade triggers, but activation deferred until paired fill.
+        // Trade triggers, but activation deferred until we leave the triggering `exch_ts` bucket.
         exch.process(&Event {
             ev: EXCH_TRADE_EVENT | BUY_EVENT,
             exch_ts: 10,
@@ -895,7 +864,7 @@ mod tests {
         })
         .unwrap();
 
-        // Flush to activate.
+        // Flush to activate by leaving the triggering `exch_ts` bucket.
         exch.process(&Event {
             ev: EXCH_EVENT,
             exch_ts: 11,
@@ -908,7 +877,7 @@ mod tests {
         })
         .unwrap();
 
-        local.process_recv_order(10, None).unwrap();
+        local.process_recv_order(11, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert!(!is_trigger_order(ord));
         assert_eq!(ord.exec_price_tick, 101);
@@ -1043,7 +1012,7 @@ mod tests {
             fval: 0.0,
         })
         .unwrap();
-        local.process_recv_order(11, None).unwrap();
+        local.process_recv_order(12, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert!(!is_trigger_order(ord));
         assert_eq!(ord.exec_price_tick, 101);
@@ -1052,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn mit_triggers_after_paired_fill_event() {
+    fn mit_triggers_after_exch_ts_bucket() {
         let (order_e2l, order_l2e) =
             order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
@@ -1093,7 +1062,7 @@ mod tests {
         exch.process_recv_order(0, None).unwrap();
         local.process_recv_order(0, None).unwrap();
 
-        // Trade <= trigger; still defer activation until paired fill.
+        // Trade <= trigger; still defer activation until we leave the triggering `exch_ts` bucket.
         exch.process(&Event {
             ev: EXCH_TRADE_EVENT | SELL_EVENT,
             exch_ts: 10,
@@ -1132,7 +1101,7 @@ mod tests {
         })
         .unwrap();
 
-        local.process_recv_order(10, None).unwrap();
+        local.process_recv_order(11, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert_eq!(ord.status, Status::Filled);
         assert_eq!(ord.exec_price_tick, 101);
@@ -1140,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_limit_triggers_after_paired_fill_and_rests() {
+    fn stop_limit_triggers_after_exch_ts_bucket_and_rests() {
         let (order_e2l, order_l2e) =
             order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
@@ -1188,7 +1157,7 @@ mod tests {
             )
         );
 
-        // Trigger trade; still no activation until fill.
+        // Trigger trade; still no activation until we leave the triggering `exch_ts` bucket.
         exch.process(&Event {
             ev: EXCH_TRADE_EVENT | BUY_EVENT,
             exch_ts: 10,
@@ -1219,7 +1188,7 @@ mod tests {
         })
         .unwrap();
 
-        // Not activated mid-batch.
+        // Not activated within the triggering `exch_ts` bucket.
         assert!(
             !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
                 &exch.queue_model,
@@ -1227,7 +1196,8 @@ mod tests {
             )
         );
 
-        // Activated at the batch boundary: should now be a resting limit order on the exchange.
+        // Activated after leaving the triggering `exch_ts` bucket: should now be a resting limit
+        // order on the exchange.
         exch.process(&Event {
             ev: EXCH_EVENT,
             exch_ts: 11,
@@ -1245,7 +1215,7 @@ mod tests {
                 order_id
             )
         );
-        local.process_recv_order(10, None).unwrap();
+        local.process_recv_order(11, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert_eq!(ord.status, Status::New);
         assert_eq!(ord.exec_qty, 0.0);
@@ -1341,7 +1311,7 @@ mod tests {
         })
         .unwrap();
 
-        local.process_recv_order(10, None).unwrap();
+        local.process_recv_order(11, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert!(!is_trigger_order(ord));
         assert_eq!(ord.status, Status::New);
