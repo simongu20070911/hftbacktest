@@ -75,7 +75,12 @@ def convert(
             pl.col('symbol') == symbol
         )
 
-    df = df.select(['ts_event', 'action', 'side', 'price', 'size', 'order_id', 'flags', 'ts_recv'])
+    # NOTE: We store Databento `sequence` into `Event.ival` to preserve a per-packet/batch boundary.
+    # This is used by the CME/MBO stop/MIT trigger logic to avoid activating mid-batch when a
+    # single vendor packet contains many execution records.
+    df = df.select(
+        ['ts_event', 'action', 'side', 'price', 'size', 'order_id', 'flags', 'sequence', 'ts_recv']
+    )
 
     tmp = np.empty(len(df), event_dtype)
 
@@ -86,11 +91,12 @@ def convert(
         _epoch_ns_col("ts_recv"),
     )
 
-    for rn, (exch_ts, action, side, price, size, order_id, flags, local_ts) in enumerate(
+    for rn, (exch_ts, action, side, price, size, order_id, flags, sequence, local_ts) in enumerate(
         df.iter_rows()
     ):
         exch_ts = int(exch_ts)
         local_ts = int(local_ts)
+        sequence = int(sequence)
 
         if action == 'A':
             ev = ADD_ORDER_EVENT
@@ -124,7 +130,8 @@ def convert(
         if snapshot_ts is not None:
             exch_ts = local_ts = snapshot_ts
 
-        tmp[rn] = (ev, exch_ts, local_ts, price, size, order_id, flags, 0)
+        # `Event.ival` carries Databento `sequence` for CME/MBO; `Event.fval` carries `flags`.
+        tmp[rn] = (ev, exch_ts, local_ts, price, size, order_id, sequence, float(flags))
 
     print('Correcting the latency')
     tmp = correct_local_timestamp(tmp, base_latency)

@@ -12,24 +12,10 @@ use crate::{
     depth::L3MarketDepth,
     prelude::OrdType,
     types::{
-        BUY_EVENT,
-        EXCH_ASK_ADD_ORDER_EVENT,
-        EXCH_ASK_DEPTH_CLEAR_EVENT,
-        EXCH_BID_ADD_ORDER_EVENT,
-        EXCH_BID_DEPTH_CLEAR_EVENT,
-        EXCH_CANCEL_ORDER_EVENT,
-        EXCH_DEPTH_CLEAR_EVENT,
-        EXCH_EVENT,
-        EXCH_FILL_EVENT,
-        EXCH_MODIFY_ORDER_EVENT,
-        EXCH_TRADE_EVENT,
-        Event,
-        Order,
-        OrderId,
-        SELL_EVENT,
-        Side,
-        Status,
-        TimeInForce,
+        BUY_EVENT, EXCH_ASK_ADD_ORDER_EVENT, EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_BID_ADD_ORDER_EVENT,
+        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_CANCEL_ORDER_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT,
+        EXCH_FILL_EVENT, EXCH_MODIFY_ORDER_EVENT, EXCH_TRADE_EVENT, Event, Order, OrderId,
+        SELL_EVENT, Side, Status, TimeInForce,
     },
 };
 
@@ -46,9 +32,21 @@ struct HeldTriggerOrder {
     params: TriggerOrderParams,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingTriggerGroupKey {
+    /// A vendor-provided “batch/packet” id (Databento `sequence`) that can span multiple exchange
+    /// timestamps while sharing the same local receive timestamp.
+    ///
+    /// When available, it provides a stronger boundary than `(exch_ts, local_ts)` for preventing
+    /// stop/MIT activation from participating in executions that belong to the same batch.
+    BatchId { local_ts: i64, batch_id: i64 },
+    /// Fallback boundary when a batch id isn't available.
+    Timestamps { exch_ts: i64, local_ts: i64 },
+}
+
 struct PendingTriggerGroup {
-    exch_ts: i64,
-    local_ts: i64,
+    key: PendingTriggerGroupKey,
+    max_exch_ts: i64,
     orders: Vec<HeldTriggerOrder>,
 }
 
@@ -144,6 +142,24 @@ where
         }
     }
 
+    fn trigger_group_key(event: &Event) -> PendingTriggerGroupKey {
+        // Backward-compatibility heuristic:
+        // - Older Databento converters stored `flags` in `Event.ival` (typically small integers).
+        // - For CME MBO, the vendor `sequence` values are large (tens of millions in the sample).
+        let batch_id = (event.ival >= 1_000_000).then_some(event.ival);
+        if let Some(batch_id) = batch_id {
+            PendingTriggerGroupKey::BatchId {
+                local_ts: event.local_ts,
+                batch_id,
+            }
+        } else {
+            PendingTriggerGroupKey::Timestamps {
+                exch_ts: event.exch_ts,
+                local_ts: event.local_ts,
+            }
+        }
+    }
+
     fn flush_pending_trigger_group(&mut self) -> Result<(), BacktestError> {
         let Some(pending) = self.pending_trigger_group.take() else {
             return Ok(());
@@ -157,10 +173,13 @@ where
 
             match held.params.kind {
                 TriggerOrderKind::StopLimit => child.order_type = OrdType::Limit,
-                TriggerOrderKind::StopMarket | TriggerOrderKind::Mit => child.order_type = OrdType::Market,
+                TriggerOrderKind::StopMarket | TriggerOrderKind::Mit => {
+                    child.order_type = OrdType::Market
+                }
             }
 
-            self.ack_new(&mut child, pending.exch_ts)?;
+            // Activation is deferred until after the entire batch/group is processed.
+            self.ack_new(&mut child, pending.max_exch_ts)?;
 
             self.order_e2l.respond(child);
         }
@@ -189,7 +208,11 @@ where
         }
 
         order.maker = maker;
-        order.exec_price_tick = if maker { order.price_tick } else { exec_price_tick };
+        order.exec_price_tick = if maker {
+            order.price_tick
+        } else {
+            exec_price_tick
+        };
 
         order.exec_qty = exec_qty;
         order.leaves_qty -= exec_qty;
@@ -299,12 +322,13 @@ where
                                 self.depth.best_ask_tick(),
                                 self.depth.best_ask_qty(),
                             ),
-                            TimeInForce::IOC | TimeInForce::FOK => self.taker_fill_at_best::<false>(
-                                order,
-                                timestamp,
-                                self.depth.best_ask_tick(),
-                                self.depth.best_ask_qty(),
-                            ),
+                            TimeInForce::IOC | TimeInForce::FOK => self
+                                .taker_fill_at_best::<false>(
+                                    order,
+                                    timestamp,
+                                    self.depth.best_ask_tick(),
+                                    self.depth.best_ask_qty(),
+                                ),
                             TimeInForce::Unsupported => Err(BacktestError::InvalidOrderRequest),
                         }
                     } else {
@@ -312,7 +336,8 @@ where
                             TimeInForce::GTC | TimeInForce::GTX => {
                                 order.status = Status::New;
                                 order.exch_timestamp = timestamp;
-                                self.queue_model.add_backtest_order(order.clone(), &self.depth)?;
+                                self.queue_model
+                                    .add_backtest_order(order.clone(), &self.depth)?;
                                 Ok(())
                             }
                             TimeInForce::FOK | TimeInForce::IOC => {
@@ -349,12 +374,13 @@ where
                                 self.depth.best_bid_tick(),
                                 self.depth.best_bid_qty(),
                             ),
-                            TimeInForce::IOC | TimeInForce::FOK => self.taker_fill_at_best::<false>(
-                                order,
-                                timestamp,
-                                self.depth.best_bid_tick(),
-                                self.depth.best_bid_qty(),
-                            ),
+                            TimeInForce::IOC | TimeInForce::FOK => self
+                                .taker_fill_at_best::<false>(
+                                    order,
+                                    timestamp,
+                                    self.depth.best_bid_tick(),
+                                    self.depth.best_bid_qty(),
+                                ),
                             TimeInForce::Unsupported => Err(BacktestError::InvalidOrderRequest),
                         }
                     } else {
@@ -362,7 +388,8 @@ where
                             TimeInForce::GTC | TimeInForce::GTX => {
                                 order.status = Status::New;
                                 order.exch_timestamp = timestamp;
-                                self.queue_model.add_backtest_order(order.clone(), &self.depth)?;
+                                self.queue_model
+                                    .add_backtest_order(order.clone(), &self.depth)?;
                                 Ok(())
                             }
                             TimeInForce::FOK | TimeInForce::IOC => {
@@ -440,6 +467,14 @@ where
 
             held.params = params;
             held.order.update(order);
+            // For held trigger orders, keep "remaining" quantity consistent with requested qty.
+            // Local-side requests may not set leaves_qty on modify, and activation clones the
+            // held order into a child order, so stale leaves_qty would leak into execution.
+            held.order.exec_qty = 0.0;
+            held.order.exec_price_tick = 0;
+            held.order.maker = false;
+            held.order.leaves_qty = held.order.qty;
+            held.order.status = Status::New;
 
             order.leaves_qty = order.qty;
             order.exch_timestamp = timestamp;
@@ -505,12 +540,18 @@ where
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
-        // If we deferred trigger activation waiting for a paired `EXCH_FILL_EVENT` at the same
-        // (exch_ts, local_ts), flush as soon as we advance to a different timestamp-group.
+        // If we deferred trigger activation waiting for the end of the current batch/group, flush
+        // as soon as we advance to a different boundary key.
+        let key = Self::trigger_group_key(event);
         if let Some(pending) = &self.pending_trigger_group
-            && (pending.exch_ts != event.exch_ts || pending.local_ts != event.local_ts)
+            && pending.key != key
         {
             self.flush_pending_trigger_group()?;
+        }
+        if let Some(pending) = &mut self.pending_trigger_group
+            && pending.key == key
+        {
+            pending.max_exch_ts = pending.max_exch_ts.max(event.exch_ts);
         }
 
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
@@ -569,12 +610,11 @@ where
                 let pending = self
                     .pending_trigger_group
                     .get_or_insert(PendingTriggerGroup {
-                        exch_ts: event.exch_ts,
-                        local_ts: event.local_ts,
+                        key,
+                        max_exch_ts: event.exch_ts,
                         orders: Vec::new(),
                     });
-                debug_assert_eq!(pending.exch_ts, event.exch_ts);
-                debug_assert_eq!(pending.local_ts, event.local_ts);
+                debug_assert_eq!(pending.key, key);
                 for order_id in triggered_ids {
                     let held = self.trigger_orders.remove(&order_id).unwrap();
                     pending.orders.push(held);
@@ -592,15 +632,6 @@ where
                     let price_tick = order.price_tick;
                     self.fill_exec::<true>(&mut order, event.exch_ts, true, price_tick, exec_qty)?;
                 }
-            }
-
-            if let Some(pending) = &self.pending_trigger_group
-                && pending.exch_ts == event.exch_ts
-                && pending.local_ts == event.local_ts
-            {
-                // Activate after the paired fill event so newly-triggered orders cannot be filled
-                // by the same execution record.
-                self.flush_pending_trigger_group()?;
             }
         }
 
@@ -648,24 +679,17 @@ mod tests {
     use super::L3PartialFillExchange;
     use crate::{
         backtest::{
+            L3QueueModel,
             assettype::LinearAsset,
             models::{CommonFees, ConstantLatency, L3FIFOQueueModel, TradingValueFeeModel},
             order::order_bus,
-            proc::{L3Local, LocalProcessor, Processor},
+            proc::{L3Local, LocalProcessor, Processor, TriggerOrderParams},
             state::State,
-            L3QueueModel,
         },
         depth::HashMapMarketDepth,
         types::{
-            BUY_EVENT,
-            EXCH_ASK_ADD_ORDER_EVENT,
-            EXCH_FILL_EVENT,
-            EXCH_TRADE_EVENT,
-            Event,
-            SELL_EVENT,
-            Side,
-            Status,
-            TimeInForce,
+            BUY_EVENT, EXCH_ASK_ADD_ORDER_EVENT, EXCH_EVENT, EXCH_FILL_EVENT, EXCH_TRADE_EVENT,
+            Event, Order, SELL_EVENT, Side, Status, TimeInForce,
         },
     };
 
@@ -680,9 +704,14 @@ mod tests {
         HashMapMarketDepth::new(/* tick_size */ 1.0, /* lot_size */ 1.0)
     }
 
+    fn is_trigger_order(order: &Order) -> bool {
+        order.q.as_any().is::<TriggerOrderParams>()
+    }
+
     #[test]
-    fn stop_market_triggers_after_paired_fill_event() {
-        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+    fn stop_market_triggers_after_batch_boundary() {
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
         let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
         let mut exch = L3PartialFillExchange::new(
@@ -701,7 +730,7 @@ mod tests {
             px: 101.0,
             qty: 2.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_001,
             fval: 0.0,
         })
         .unwrap();
@@ -722,8 +751,8 @@ mod tests {
         local.process_recv_order(0, None).unwrap();
         assert_eq!(local.orders().get(&order_id).unwrap().status, Status::New);
 
-        // Trade triggers the stop, but activation must be deferred until the paired fill at the
-        // same (exch_ts, local_ts) has been processed.
+        // Trade triggers the stop, but activation must be deferred until the end of the Databento
+        // batch/group so it cannot participate in any executions that belong to the same batch.
         exch.process(&Event {
             ev: EXCH_TRADE_EVENT | BUY_EVENT,
             exch_ts: 10,
@@ -731,14 +760,15 @@ mod tests {
             px: 105.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
             fval: 0.0,
         })
         .unwrap();
         local.process_recv_order(10, None).unwrap();
         assert_eq!(local.orders().get(&order_id).unwrap().exec_qty, 0.0);
 
-        // Paired fill at the exact same timestamps.
+        // Multiple fill records can belong to the same triggering batch (including across
+        // different exchange timestamps while sharing the same local receive time).
         exch.process(&Event {
             ev: EXCH_FILL_EVENT | SELL_EVENT,
             exch_ts: 10,
@@ -746,13 +776,41 @@ mod tests {
             px: 101.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 101.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
             fval: 0.0,
         })
         .unwrap();
 
-        // Stop-Market activates as a normal Market order at ts=10 and fills at the current best ask.
-        local.process_recv_order(10, None).unwrap();
+        // Still not activated mid-batch.
+        local.process_recv_order(11, None).unwrap();
+        assert_eq!(local.orders().get(&order_id).unwrap().exec_qty, 0.0);
+
+        // Advance to the next batch/group to flush pending triggers.
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 12,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // Stop-Market activates as a normal Market order and fills at the current best ask.
+        local.process_recv_order(11, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert_eq!(ord.status, Status::Filled);
         assert_eq!(ord.exec_price_tick, 101);
@@ -761,8 +819,108 @@ mod tests {
     }
 
     #[test]
-    fn mit_triggers_after_paired_fill_event() {
-        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+    fn stop_market_modify_qty_is_used_on_activation() {
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+
+        let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        );
+
+        // Best ask = 101, qty = 2 (so a triggered market order qty=3 should fill 2 and cancel the remainder).
+        let mkt_ask_order_id = 10;
+        exch.process(&Event {
+            ev: EXCH_ASK_ADD_ORDER_EVENT,
+            exch_ts: 1,
+            local_ts: 101,
+            px: 101.0,
+            qty: 2.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_001,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // Submit stop-market buy qty=1, trigger at 104.
+        let order_id = 1;
+        local
+            .submit_stop_market(
+                order_id,
+                Side::Buy,
+                /* trigger */ 104.0,
+                /* qty */ 1.0,
+                TimeInForce::IOC,
+                /* now */ 0,
+            )
+            .unwrap();
+        exch.process_recv_order(0, None).unwrap();
+        local.process_recv_order(0, None).unwrap();
+        assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
+
+        // Modify qty to 3 before trigger (same trigger price).
+        local
+            .modify(
+                order_id, /* trigger */ 104.0, /* qty */ 3.0, /* now */ 5,
+            )
+            .unwrap();
+        exch.process_recv_order(5, None).unwrap();
+        local.process_recv_order(5, None).unwrap();
+        assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
+
+        // Trade triggers, but activation deferred until paired fill.
+        exch.process(&Event {
+            ev: EXCH_TRADE_EVENT | BUY_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 105.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 101.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // Flush to activate.
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        local.process_recv_order(10, None).unwrap();
+        let ord = local.orders().get(&order_id).unwrap();
+        assert!(!is_trigger_order(ord));
+        assert_eq!(ord.exec_price_tick, 101);
+        assert_eq!(ord.exec_qty, 2.0);
+        assert_eq!(ord.leaves_qty, 0.0);
+        assert_eq!(ord.status, Status::Canceled);
+    }
+
+    #[test]
+    fn stop_market_modify_updates_trigger_price() {
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
         let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
         let mut exch = L3PartialFillExchange::new(
@@ -781,7 +939,141 @@ mod tests {
             px: 101.0,
             qty: 2.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_001,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // Submit stop-market buy trigger=104.
+        let order_id = 1;
+        local
+            .submit_stop_market(
+                order_id,
+                Side::Buy,
+                /* trigger */ 104.0,
+                /* qty */ 1.0,
+                TimeInForce::IOC,
+                /* now */ 0,
+            )
+            .unwrap();
+        exch.process_recv_order(0, None).unwrap();
+        local.process_recv_order(0, None).unwrap();
+
+        // Raise the trigger to 106 via modify().
+        local
+            .modify(
+                order_id, /* trigger */ 106.0, /* qty */ 1.0, /* now */ 5,
+            )
+            .unwrap();
+        exch.process_recv_order(5, None).unwrap();
+        local.process_recv_order(5, None).unwrap();
+        assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
+
+        // Trade at 105 would have triggered the original order, but should NOT trigger now.
+        exch.process(&Event {
+            ev: EXCH_TRADE_EVENT | BUY_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 105.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 101.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+        // Even after advancing the batch, there should be no activation (not triggered).
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
+            fval: 0.0,
+        })
+        .unwrap();
+        local.process_recv_order(10, None).unwrap();
+        let ord = local.orders().get(&order_id).unwrap();
+        assert!(is_trigger_order(ord));
+        assert_eq!(ord.exec_qty, 0.0);
+
+        // Trade at 106 now triggers.
+        exch.process(&Event {
+            ev: EXCH_TRADE_EVENT | BUY_EVENT,
+            exch_ts: 11,
+            local_ts: 101,
+            px: 106.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_004,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 11,
+            local_ts: 101,
+            px: 101.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_004,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 12,
+            local_ts: 101,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_005,
+            fval: 0.0,
+        })
+        .unwrap();
+        local.process_recv_order(11, None).unwrap();
+        let ord = local.orders().get(&order_id).unwrap();
+        assert!(!is_trigger_order(ord));
+        assert_eq!(ord.exec_price_tick, 101);
+        assert_eq!(ord.exec_qty, 1.0);
+        assert_eq!(ord.status, Status::Filled);
+    }
+
+    #[test]
+    fn mit_triggers_after_paired_fill_event() {
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+
+        let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        );
+
+        // Best ask = 101, qty = 2.
+        let mkt_ask_order_id = 10;
+        exch.process(&Event {
+            ev: EXCH_ASK_ADD_ORDER_EVENT,
+            exch_ts: 1,
+            local_ts: 101,
+            px: 101.0,
+            qty: 2.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_001,
             fval: 0.0,
         })
         .unwrap();
@@ -809,7 +1101,7 @@ mod tests {
             px: 95.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
             fval: 0.0,
         })
         .unwrap();
@@ -823,7 +1115,19 @@ mod tests {
             px: 101.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
             fval: 0.0,
         })
         .unwrap();
@@ -837,7 +1141,8 @@ mod tests {
 
     #[test]
     fn stop_limit_triggers_after_paired_fill_and_rests() {
-        let (order_e2l, order_l2e) = order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
 
         let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
         let mut exch = L3PartialFillExchange::new(
@@ -856,7 +1161,7 @@ mod tests {
             px: 101.0,
             qty: 2.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_001,
             fval: 0.0,
         })
         .unwrap();
@@ -891,7 +1196,7 @@ mod tests {
             px: 105.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
             fval: 0.0,
         })
         .unwrap();
@@ -909,12 +1214,31 @@ mod tests {
             px: 101.0,
             qty: 1.0,
             order_id: mkt_ask_order_id,
-            ival: 0,
+            ival: 1_000_002,
             fval: 0.0,
         })
         .unwrap();
 
-        // Activated: should now be a resting limit order on the exchange.
+        // Not activated mid-batch.
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &exch.queue_model,
+                order_id
+            )
+        );
+
+        // Activated at the batch boundary: should now be a resting limit order on the exchange.
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
+            fval: 0.0,
+        })
+        .unwrap();
         assert!(
             <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
                 &exch.queue_model,
@@ -924,6 +1248,104 @@ mod tests {
         local.process_recv_order(10, None).unwrap();
         let ord = local.orders().get(&order_id).unwrap();
         assert_eq!(ord.status, Status::New);
+        assert_eq!(ord.exec_qty, 0.0);
+    }
+
+    #[test]
+    fn stop_limit_modify_qty_is_used_on_activation() {
+        let (order_e2l, order_l2e) =
+            order_bus(ConstantLatency::new(/* entry */ 0, /* resp */ 0));
+
+        let mut local = L3Local::new(make_depth(), make_state(), 0, order_l2e);
+        let mut exch = L3PartialFillExchange::new(
+            make_depth(),
+            make_state(),
+            L3FIFOQueueModel::new(),
+            order_e2l,
+        );
+
+        // Best ask = 101, qty = 2.
+        let mkt_ask_order_id = 10;
+        exch.process(&Event {
+            ev: EXCH_ASK_ADD_ORDER_EVENT,
+            exch_ts: 1,
+            local_ts: 101,
+            px: 101.0,
+            qty: 2.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_001,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        // Buy Stop-Limit triggers on trade >= 104, then places a LIMIT at 99.
+        let order_id = 1;
+        local
+            .submit_stop_limit(
+                order_id,
+                Side::Buy,
+                /* trigger */ 104.0,
+                /* limit */ 99.0,
+                /* qty */ 1.0,
+                TimeInForce::GTC,
+                /* now */ 0,
+            )
+            .unwrap();
+        exch.process_recv_order(0, None).unwrap();
+        local.process_recv_order(0, None).unwrap();
+        assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
+
+        // Modify qty to 3 before trigger.
+        local
+            .modify_stop_limit(
+                order_id, /* trigger */ 104.0, /* limit */ 99.0, /* qty */ 3.0,
+                /* now */ 5,
+            )
+            .unwrap();
+        exch.process_recv_order(5, None).unwrap();
+        local.process_recv_order(5, None).unwrap();
+        assert!(is_trigger_order(local.orders().get(&order_id).unwrap()));
+
+        exch.process(&Event {
+            ev: EXCH_TRADE_EVENT | BUY_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 105.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+        exch.process(&Event {
+            ev: EXCH_FILL_EVENT | SELL_EVENT,
+            exch_ts: 10,
+            local_ts: 100,
+            px: 101.0,
+            qty: 1.0,
+            order_id: mkt_ask_order_id,
+            ival: 1_000_002,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        exch.process(&Event {
+            ev: EXCH_EVENT,
+            exch_ts: 11,
+            local_ts: 100,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 1_000_003,
+            fval: 0.0,
+        })
+        .unwrap();
+
+        local.process_recv_order(10, None).unwrap();
+        let ord = local.orders().get(&order_id).unwrap();
+        assert!(!is_trigger_order(ord));
+        assert_eq!(ord.status, Status::New);
+        assert_eq!(ord.leaves_qty, 3.0);
         assert_eq!(ord.exec_qty, 0.0);
     }
 }

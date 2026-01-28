@@ -74,6 +74,32 @@ where
             last_order_latency: None,
         }
     }
+
+    fn submit_common(
+        &mut self,
+        mut order: Order,
+        current_timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        if self.orders.contains_key(&order.order_id) {
+            return Err(BacktestError::OrderIdExist);
+        }
+
+        order.req = Status::New;
+        order.local_timestamp = current_timestamp;
+        self.orders.insert(order.order_id, order.clone());
+
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+        order.maker = false;
+        self.order_l2e.request(order, |order| {
+            order.req = Status::Rejected;
+            order.exec_qty = 0.0;
+            order.exec_price_tick = 0;
+            order.maker = false;
+        });
+
+        Ok(())
+    }
 }
 
 impl<AT, LM, MD, FM> LocalProcessor<MD> for L3Local<AT, LM, MD, FM>
@@ -94,12 +120,8 @@ where
         time_in_force: TimeInForce,
         current_timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if self.orders.contains_key(&order_id) {
-            return Err(BacktestError::OrderIdExist);
-        }
-
         let price_tick = (price / self.depth.tick_size()).round() as i64;
-        let mut order = Order::new(
+        let order = Order::new(
             order_id,
             price_tick,
             self.depth.tick_size(),
@@ -108,21 +130,7 @@ where
             order_type,
             time_in_force,
         );
-        order.req = Status::New;
-        order.local_timestamp = current_timestamp;
-        self.orders.insert(order.order_id, order.clone());
-
-        order.exec_qty = 0.0;
-        order.exec_price_tick = 0;
-        order.maker = false;
-        self.order_l2e.request(order, |order| {
-            order.req = Status::Rejected;
-            order.exec_qty = 0.0;
-            order.exec_price_tick = 0;
-            order.maker = false;
-        });
-
-        Ok(())
+        self.submit_common(order, current_timestamp)
     }
 
     fn submit_stop_market(
@@ -134,10 +142,6 @@ where
         time_in_force: TimeInForce,
         current_timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if self.orders.contains_key(&order_id) {
-            return Err(BacktestError::OrderIdExist);
-        }
-
         let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
         let mut order = Order::new(
             order_id,
@@ -152,21 +156,7 @@ where
             kind: TriggerOrderKind::StopMarket,
             trigger_tick,
         });
-        order.req = Status::New;
-        order.local_timestamp = current_timestamp;
-        self.orders.insert(order.order_id, order.clone());
-
-        order.exec_qty = 0.0;
-        order.exec_price_tick = 0;
-        order.maker = false;
-        self.order_l2e.request(order, |order| {
-            order.req = Status::Rejected;
-            order.exec_qty = 0.0;
-            order.exec_price_tick = 0;
-            order.maker = false;
-        });
-
-        Ok(())
+        self.submit_common(order, current_timestamp)
     }
 
     fn submit_mit(
@@ -178,10 +168,6 @@ where
         time_in_force: TimeInForce,
         current_timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if self.orders.contains_key(&order_id) {
-            return Err(BacktestError::OrderIdExist);
-        }
-
         let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
         let mut order = Order::new(
             order_id,
@@ -196,21 +182,7 @@ where
             kind: TriggerOrderKind::Mit,
             trigger_tick,
         });
-        order.req = Status::New;
-        order.local_timestamp = current_timestamp;
-        self.orders.insert(order.order_id, order.clone());
-
-        order.exec_qty = 0.0;
-        order.exec_price_tick = 0;
-        order.maker = false;
-        self.order_l2e.request(order, |order| {
-            order.req = Status::Rejected;
-            order.exec_qty = 0.0;
-            order.exec_price_tick = 0;
-            order.maker = false;
-        });
-
-        Ok(())
+        self.submit_common(order, current_timestamp)
     }
 
     fn submit_stop_limit(
@@ -223,10 +195,6 @@ where
         time_in_force: TimeInForce,
         current_timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if self.orders.contains_key(&order_id) {
-            return Err(BacktestError::OrderIdExist);
-        }
-
         let trigger_tick = (trigger_price / self.depth.tick_size()).round() as i64;
         let limit_tick = (limit_price / self.depth.tick_size()).round() as i64;
         let mut order = Order::new(
@@ -242,21 +210,7 @@ where
             kind: TriggerOrderKind::StopLimit,
             trigger_tick,
         });
-        order.req = Status::New;
-        order.local_timestamp = current_timestamp;
-        self.orders.insert(order.order_id, order.clone());
-
-        order.exec_qty = 0.0;
-        order.exec_price_tick = 0;
-        order.maker = false;
-        self.order_l2e.request(order, |order| {
-            order.req = Status::Rejected;
-            order.exec_qty = 0.0;
-            order.exec_price_tick = 0;
-            order.maker = false;
-        });
-
-        Ok(())
+        self.submit_common(order, current_timestamp)
     }
 
     fn modify_stop_limit(
@@ -299,6 +253,7 @@ where
 
         order.price_tick = limit_tick;
         order.qty = qty;
+        order.leaves_qty = qty;
         if let Some(params) = order.q.as_any_mut().downcast_mut::<TriggerOrderParams>() {
             params.trigger_tick = trigger_tick;
         }
@@ -356,6 +311,18 @@ where
         let price_tick = (price / self.depth.tick_size()).round() as i64;
         order.price_tick = price_tick;
         order.qty = qty;
+        order.leaves_qty = qty;
+        if let Some(params) = order.q.as_any_mut().downcast_mut::<TriggerOrderParams>() {
+            match params.kind {
+                TriggerOrderKind::StopMarket | TriggerOrderKind::Mit => {
+                    // For Stop-Market and MIT, `modify(price, qty)` means modifying the trigger.
+                    params.trigger_tick = price_tick;
+                }
+                TriggerOrderKind::StopLimit => {
+                    // For Stop-Limit, `modify(price, qty)` modifies the post-trigger limit price.
+                }
+            }
+        }
 
         order.req = Status::Replaced;
         order.local_timestamp = current_timestamp;
@@ -597,22 +564,17 @@ mod tests {
     use crate::{
         backtest::{
             assettype::LinearAsset,
-            models::{CommonFees, ConstantLatency, L3FIFOQueueModel, LatencyModel, TradingValueFeeModel},
+            models::{
+                CommonFees, ConstantLatency, L3FIFOQueueModel, LatencyModel, TradingValueFeeModel,
+            },
             order::{order_bus, order_bus_with_max_timestamp_reordering},
             proc::{L3PartialFillExchange, LocalProcessor, Processor},
             state::State,
         },
         depth::HashMapMarketDepth,
         types::{
-            Event,
-            OrdType,
-            Order,
-            Side,
-            Status,
-            TimeInForce,
-            EXCH_BID_ADD_ORDER_EVENT,
-            EXCH_FILL_EVENT,
-            SELL_EVENT,
+            EXCH_BID_ADD_ORDER_EVENT, EXCH_FILL_EVENT, Event, OrdType, Order, SELL_EVENT, Side,
+            Status, TimeInForce,
         },
     };
 
