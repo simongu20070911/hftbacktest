@@ -877,6 +877,67 @@ where
         wait: bool,
     ) -> Result<ElapseResult, Self::Error>;
 
+    /// Submits a stop-market order (server-side trigger). The trigger is evaluated on trade events,
+    /// and once triggered the order becomes an `OrdType::Market` order.
+    ///
+    /// * `trigger_price` - Trigger price.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_stop_market(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+
+    /// Submits a market-if-touched (MIT) order (server-side trigger). The trigger is evaluated on
+    /// trade events, and once triggered the order becomes an `OrdType::Market` order.
+    ///
+    /// * `trigger_price` - Trigger price.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_mit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+
+    /// Submits a stop-limit order (server-side trigger). The trigger is evaluated on trade events.
+    /// Once triggered, the order becomes an `OrdType::Limit` order at `limit_price`.
+    ///
+    /// * `trigger_price` - Trigger price.
+    /// * `limit_price` - Limit price after trigger.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_stop_limit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+
+    /// Modifies a stop-limit order's trigger and limit prices (server-side trigger).
+    fn modify_stop_limit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+
     /// Modifies an open order.
     ///
     /// * `asset_no` - Asset number at which this command will be executed.

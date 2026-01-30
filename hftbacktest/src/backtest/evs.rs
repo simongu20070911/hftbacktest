@@ -50,6 +50,10 @@ impl EventSet {
         }
     }
 
+    pub fn uses_seq_tie_break(&self) -> bool {
+        self.use_seq_tie_break
+    }
+
     /// Returns the next event to be processed, which has the earliest timestamp.
     pub fn next(&self) -> Option<EventIntent> {
         let mut evst_no = 0;

@@ -543,6 +543,66 @@ where
         )
     }
 
+    fn submit_stop_market(
+        &mut self,
+        _asset_no: usize,
+        _order_id: OrderId,
+        _side: Side,
+        _trigger_price: f64,
+        _qty: f64,
+        _time_in_force: TimeInForce,
+        _wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        Err(BotError::Custom(
+            "trigger orders (stop-market) are not supported in LiveBot".to_string(),
+        ))
+    }
+
+    fn submit_mit(
+        &mut self,
+        _asset_no: usize,
+        _order_id: OrderId,
+        _side: Side,
+        _trigger_price: f64,
+        _qty: f64,
+        _time_in_force: TimeInForce,
+        _wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        Err(BotError::Custom(
+            "trigger orders (MIT) are not supported in LiveBot".to_string(),
+        ))
+    }
+
+    fn submit_stop_limit(
+        &mut self,
+        _asset_no: usize,
+        _order_id: OrderId,
+        _side: Side,
+        _trigger_price: f64,
+        _limit_price: f64,
+        _qty: f64,
+        _time_in_force: TimeInForce,
+        _wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        Err(BotError::Custom(
+            "trigger orders (stop-limit) are not supported in LiveBot".to_string(),
+        ))
+    }
+
+    fn modify_stop_limit(
+        &mut self,
+        _asset_no: usize,
+        _order_id: OrderId,
+        _trigger_price: f64,
+        _limit_price: f64,
+        _qty: f64,
+        _wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        Err(BotError::Custom(
+            "trigger order modifications (stop-limit) are not supported in LiveBot".to_string(),
+        ))
+    }
+
     #[inline]
     fn modify(
         &mut self,

@@ -901,6 +901,10 @@ where
         }
     }
 
+    pub fn uses_seq_tie_break(&self) -> bool {
+        self.evs.uses_seq_tie_break()
+    }
+
     #[inline]
     fn compute_exch_order_seq(
         policy: ExchOrderEqualTsPolicy,
@@ -1293,6 +1297,120 @@ where
                     asset_no,
                     order_id: order.order_id,
                 },
+            );
+        }
+        Ok(ElapseResult::Ok)
+    }
+
+    #[inline]
+    fn submit_stop_market(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        let local = self.local.get_mut(asset_no).unwrap();
+        local.submit_stop_market(
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            self.cur_ts,
+        )?;
+
+        if wait {
+            return self.goto::<false>(
+                UNTIL_END_OF_DATA,
+                WaitOrderResponse::Specified { asset_no, order_id },
+            );
+        }
+        Ok(ElapseResult::Ok)
+    }
+
+    #[inline]
+    fn submit_mit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        let local = self.local.get_mut(asset_no).unwrap();
+        local.submit_mit(
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            self.cur_ts,
+        )?;
+
+        if wait {
+            return self.goto::<false>(
+                UNTIL_END_OF_DATA,
+                WaitOrderResponse::Specified { asset_no, order_id },
+            );
+        }
+        Ok(ElapseResult::Ok)
+    }
+
+    #[inline]
+    fn submit_stop_limit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        side: Side,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        let local = self.local.get_mut(asset_no).unwrap();
+        local.submit_stop_limit(
+            order_id,
+            side,
+            trigger_price,
+            limit_price,
+            qty,
+            time_in_force,
+            self.cur_ts,
+        )?;
+
+        if wait {
+            return self.goto::<false>(
+                UNTIL_END_OF_DATA,
+                WaitOrderResponse::Specified { asset_no, order_id },
+            );
+        }
+        Ok(ElapseResult::Ok)
+    }
+
+    #[inline]
+    fn modify_stop_limit(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        trigger_price: f64,
+        limit_price: f64,
+        qty: f64,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error> {
+        let local = self.local.get_mut(asset_no).unwrap();
+        local.modify_stop_limit(order_id, trigger_price, limit_price, qty, self.cur_ts)?;
+
+        if wait {
+            return self.goto::<false>(
+                UNTIL_END_OF_DATA,
+                WaitOrderResponse::Specified { asset_no, order_id },
             );
         }
         Ok(ElapseResult::Ok)

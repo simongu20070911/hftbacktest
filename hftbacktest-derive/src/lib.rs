@@ -323,7 +323,8 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                             Asset {
                                 local,
                                 exch,
-                                reader
+                                reader,
+                                use_seq_tie_break: false,
                             }
                         },
                     });
