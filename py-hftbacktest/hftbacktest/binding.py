@@ -569,6 +569,10 @@ hashmapbt_current_timestamp = lib.hashmapbt_current_timestamp
 hashmapbt_current_timestamp.restype = c_int64
 hashmapbt_current_timestamp.argtypes = [c_void_p]
 
+hashmapbt_uses_seq_tie_break = lib.hashmapbt_uses_seq_tie_break
+hashmapbt_uses_seq_tie_break.restype = c_bool
+hashmapbt_uses_seq_tie_break.argtypes = [c_void_p]
+
 hashmapbt_depth = lib.hashmapbt_depth
 hashmapbt_depth.restype = c_void_p
 hashmapbt_depth.argtypes = [c_void_p, c_uint64]
@@ -604,6 +608,58 @@ hashmapbt_submit_sell_order.argtypes = [
     c_double,
     c_uint8,
     c_uint8,
+    c_bool
+]
+
+hashmapbt_submit_stop_market = lib.hashmapbt_submit_stop_market
+hashmapbt_submit_stop_market.restype = c_int64
+hashmapbt_submit_stop_market.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+hashmapbt_submit_stop_limit = lib.hashmapbt_submit_stop_limit
+hashmapbt_submit_stop_limit.restype = c_int64
+hashmapbt_submit_stop_limit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+hashmapbt_submit_mit = lib.hashmapbt_submit_mit
+hashmapbt_submit_mit.restype = c_int64
+hashmapbt_submit_mit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+hashmapbt_modify_stop_limit = lib.hashmapbt_modify_stop_limit
+hashmapbt_modify_stop_limit.restype = c_int64
+hashmapbt_modify_stop_limit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_double,
+    c_double,
+    c_double,
     c_bool
 ]
 
@@ -656,6 +712,10 @@ class HashMapMarketDepthBacktest:
         In backtesting, this timestamp reflects the time at which the backtesting is conducted within the provided data.
         """
         return hashmapbt_current_timestamp(self.ptr)
+
+    @property
+    def uses_seq_tie_break(self) -> bool:
+        return hashmapbt_uses_seq_tie_break(self.ptr)
 
     def depth(self, asset_no: uint64) -> HashMapMarketDepth:
         """
@@ -818,6 +878,90 @@ class HashMapMarketDepthBacktest:
             * Otherwise, an error occurred.
         """
         return hashmapbt_submit_sell_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
+
+    def submit_stop_market(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return hashmapbt_submit_stop_market(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def submit_stop_limit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            limit_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return hashmapbt_submit_stop_limit(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            limit_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def submit_mit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return hashmapbt_submit_mit(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def modify_stop_limit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            trigger_price: float64,
+            limit_price: float64,
+            qty: float64,
+            wait: bool
+    ) -> int64:
+        return hashmapbt_modify_stop_limit(
+            self.ptr,
+            asset_no,
+            order_id,
+            trigger_price,
+            limit_price,
+            qty,
+            wait
+        )
 
     def modify(self, asset_no: uint64, order_id: uint64, price: float, qty: float, wait: bool) -> int64:
         """
@@ -1016,6 +1160,10 @@ roivecbt_current_timestamp = lib.roivecbt_current_timestamp
 roivecbt_current_timestamp.restype = c_int64
 roivecbt_current_timestamp.argtypes = [c_void_p]
 
+roivecbt_uses_seq_tie_break = lib.roivecbt_uses_seq_tie_break
+roivecbt_uses_seq_tie_break.restype = c_bool
+roivecbt_uses_seq_tie_break.argtypes = [c_void_p]
+
 roivecbt_depth = lib.roivecbt_depth
 roivecbt_depth.restype = c_void_p
 roivecbt_depth.argtypes = [c_void_p, c_uint64]
@@ -1051,6 +1199,58 @@ roivecbt_submit_sell_order.argtypes = [
     c_double,
     c_uint8,
     c_uint8,
+    c_bool
+]
+
+roivecbt_submit_stop_market = lib.roivecbt_submit_stop_market
+roivecbt_submit_stop_market.restype = c_int64
+roivecbt_submit_stop_market.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+roivecbt_submit_stop_limit = lib.roivecbt_submit_stop_limit
+roivecbt_submit_stop_limit.restype = c_int64
+roivecbt_submit_stop_limit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+roivecbt_submit_mit = lib.roivecbt_submit_mit
+roivecbt_submit_mit.restype = c_int64
+roivecbt_submit_mit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_int64,
+    c_double,
+    c_double,
+    c_uint8,
+    c_bool
+]
+
+roivecbt_modify_stop_limit = lib.roivecbt_modify_stop_limit
+roivecbt_modify_stop_limit.restype = c_int64
+roivecbt_modify_stop_limit.argtypes = [
+    c_void_p,
+    c_uint64,
+    c_uint64,
+    c_double,
+    c_double,
+    c_double,
     c_bool
 ]
 
@@ -1099,6 +1299,10 @@ class ROIVectorMarketDepthBacktest:
         In backtesting, this timestamp reflects the time at which the backtesting is conducted within the provided data.
         """
         return roivecbt_current_timestamp(self.ptr)
+
+    @property
+    def uses_seq_tie_break(self) -> bool:
+        return roivecbt_uses_seq_tie_break(self.ptr)
 
     def depth(self, asset_no: uint64) -> ROIVectorMarketDepth:
         """
@@ -1261,6 +1465,90 @@ class ROIVectorMarketDepthBacktest:
             * Otherwise, an error occurred.
         """
         return roivecbt_submit_sell_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
+
+    def submit_stop_market(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return roivecbt_submit_stop_market(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def submit_stop_limit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            limit_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return roivecbt_submit_stop_limit(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            limit_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def submit_mit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            side: int64,
+            trigger_price: float64,
+            qty: float64,
+            time_in_force: uint8,
+            wait: bool
+    ) -> int64:
+        return roivecbt_submit_mit(
+            self.ptr,
+            asset_no,
+            order_id,
+            side,
+            trigger_price,
+            qty,
+            time_in_force,
+            wait
+        )
+
+    def modify_stop_limit(
+            self,
+            asset_no: uint64,
+            order_id: uint64,
+            trigger_price: float64,
+            limit_price: float64,
+            qty: float64,
+            wait: bool
+    ) -> int64:
+        return roivecbt_modify_stop_limit(
+            self.ptr,
+            asset_no,
+            order_id,
+            trigger_price,
+            limit_price,
+            qty,
+            wait
+        )
 
     def modify(self, asset_no: uint64, order_id: uint64, price: float, qty: float, wait: bool) -> int64:
         """

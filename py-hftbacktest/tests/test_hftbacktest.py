@@ -1,77 +1,61 @@
 import unittest
-import numpy as np
 
+import numpy as np
 from numba import njit
 
-from hftbacktest import (
-    BacktestAsset,
-    HashMapMarketDepthBacktest,
-    ALL_ASSETS, ROIVectorMarketDepthBacktest
+import hftbacktest as hbt
+from hftbacktest.types import (
+    ADD_ORDER_EVENT,
+    BUY_EVENT,
+    DEPTH_BBO_EVENT,
+    EXCH_EVENT,
+    event_dtype,
 )
 
 
 @njit
-def test_run(hbt):
-    order_id = 0
-    while hbt.elapse(10_000_000_000) == 0:
-        current_timestamp = hbt.current_timestamp
-        depth = hbt.depth(0)
-        best_bid = depth.best_bid
-        best_ask = depth.best_ask
-
-        # trades = hbt.last_trades(0)
-        #
-        # i = 0
-        # for trade in trades:
-        #     print(trade.local_ts, trade.px, trade.qty)
-        #     i += 1
-        #     if i > 5:
-        #         break
-
-        hbt.clear_last_trades(ALL_ASSETS)
-
-        cnt = 0
-        orders = hbt.orders(0)
-        values = orders.values()
-        while True:
-            order = values.next()
-            if order is None:
-                break
-            cnt += 1
-            print(order.order_id, order.side, order.price_tick, order.qty)
-
-        hbt.clear_inactive_orders(ALL_ASSETS)
-
-        if cnt <= 2:
-            hbt.submit_buy_order(0, order_id, best_bid, 1, 1, 0, False)
-            order_id += 1
-            hbt.submit_sell_order(0, order_id, best_ask, 1, 1, 0, False)
-            order_id += 1
-
-        print(current_timestamp, best_bid, best_ask)
+def run_until_end(bt):
+    while bt.elapse(10_000_000_000) == 0:
+        _ = bt.current_timestamp
+        _ = bt.depth(0).best_bid
+        _ = bt.depth(0).best_ask
+    return bt.current_timestamp
 
 
 class TestPyHftBacktest(unittest.TestCase):
-    def setUp(self) -> None:
-        pass
+    def test_build_and_elapse_hashmap_l2(self):
+        data = np.zeros(2, dtype=event_dtype)
+        # Seed a best-bid update so depth getters are exercised under numba.
+        data[0]["ev"] = EXCH_EVENT | DEPTH_BBO_EVENT | BUY_EVENT
+        data[0]["exch_ts"] = 1
+        data[0]["local_ts"] = 1
+        data[0]["px"] = 100.0
+        data[0]["qty"] = 1.0
+        data[0]["ival"] = 1
 
-    def test_run_backtest(self):
-        arr = np.load('tmp_20240501.npz')['data']
+        # A second event to ensure the reader advances.
+        data[1]["ev"] = EXCH_EVENT | ADD_ORDER_EVENT | BUY_EVENT
+        data[1]["exch_ts"] = 2
+        data[1]["local_ts"] = 2
+        data[1]["px"] = 100.0
+        data[1]["qty"] = 1.0
+        data[1]["order_id"] = 1
+        data[1]["ival"] = 2
 
         asset = (
-            BacktestAsset()
-                .linear_asset(1.0)
-                .data(['tmp_20240501.npz'])
-                .no_partial_fill_exchange()
-                .constant_latency(100, 100)
-                .power_prob_queue_model3(3.0)
-                .tick_size(0.000001)
-                .lot_size(1.0)
-                .trade_len(1000)
-                .roi_lb(0.0)
-                .roi_ub(1.0)
+            hbt.L2Asset()
+              .data(data)
+              .tick_size(1.0)
+              .lot_size(1.0)
+              .linear_asset(1.0)
+              .no_partial_fill_exchange()
+              .constant_latency(0, 0)
         )
+        bt = hbt.BacktestBuilder.hashmap().add_asset(asset).build()
+        ts = run_until_end(bt)
+        self.assertGreaterEqual(int(ts), 0)
 
-        # hbt = HashMapMarketDepthMultiAssetMultiExchangeBacktest([asset])
-        hbt = ROIVectorMarketDepthBacktest([asset])
-        test_run(hbt)
+
+if __name__ == "__main__":
+    unittest.main()
+

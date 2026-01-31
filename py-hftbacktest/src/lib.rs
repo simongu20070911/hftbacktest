@@ -12,6 +12,9 @@ use hftbacktest::{
         DataSource,
         assettype::{InverseAsset, LinearAsset},
         data::{Data, DataPtr, FeedLatencyAdjustment, Reader, read_npz_file},
+        ExchangeKind as CoreExchangeKind,
+        ExchOrderEqualTsPolicy,
+        L3AssetBuilder,
         models::{
             CommonFees,
             ConstantLatency,
@@ -42,6 +45,7 @@ use hftbacktest::{
         state::State,
     },
     prelude::{ApplySnapshot, Event, HashMapMarketDepth, ROIVectorMarketDepth},
+    types::BuildError,
 };
 use hftbacktest_derive::build_asset;
 pub use order::*;
@@ -120,7 +124,10 @@ pub struct BacktestAsset {
     initial_snapshot: Option<DataSource<Event>>,
     fee_model: FeeModel,
     latency_offset: i64,
+    order_bus_max_timestamp_reordering: i64,
     parallel_load: bool,
+    cme_mbo_order_not_found_reject_marks_inactive: bool,
+    cme_databento_mbo: bool,
 }
 
 unsafe impl Send for BacktestAsset {}
@@ -151,7 +158,10 @@ impl BacktestAsset {
                 fees: CommonFees::new(0.0, 0.0),
             },
             latency_offset: 0,
+            order_bus_max_timestamp_reordering: 0,
             parallel_load: true,
+            cme_mbo_order_not_found_reject_marks_inactive: false,
+            cme_databento_mbo: false,
         }
     }
 
@@ -175,6 +185,21 @@ impl BacktestAsset {
     ///                     The default value is `0`.
     pub fn latency_offset(mut slf: PyRefMut<Self>, latency_offset: i64) -> PyRefMut<Self> {
         slf.latency_offset = latency_offset;
+        slf
+    }
+
+    /// Sets the maximum timestamp reordering window for the internal order buses.
+    ///
+    /// A value of `0` keeps the strict FIFO/clamp behavior (default). A positive value allows
+    /// order requests/responses to be reordered by timestamp within the specified window.
+    ///
+    /// Args:
+    ///     max_timestamp_reordering: maximum allowed reordering window in timestamp units.
+    pub fn order_bus_max_timestamp_reordering(
+        mut slf: PyRefMut<Self>,
+        max_timestamp_reordering: i64,
+    ) -> PyRefMut<Self> {
+        slf.order_bus_max_timestamp_reordering = max_timestamp_reordering.max(0);
         slf
     }
 
@@ -445,6 +470,33 @@ impl BacktestAsset {
         slf
     }
 
+    /// CME/Databento MBO policy: treat cancel/modify `OrderNotFound` rejects as "order not active",
+    /// so the reject response marks the order inactive immediately.
+    ///
+    /// Default: `false` (keep legacy behavior).
+    pub fn cme_mbo_order_not_found_reject_marks_inactive(
+        mut slf: PyRefMut<Self>,
+        enabled: bool,
+    ) -> PyRefMut<Self> {
+        slf.cme_mbo_order_not_found_reject_marks_inactive = enabled;
+        slf
+    }
+
+    /// Convenience switch for CME via Databento MBO backtests.
+    ///
+    /// When enabled, this forces the L3 partial fill exchange model and enables CME/MBO-specific
+    /// physics policies in the Rust engine (including seq tie-break).
+    ///
+    /// This is the only supported entrypoint for L3 PartialFillExchange from Python.
+    pub fn cme_databento_mbo(mut slf: PyRefMut<Self>, enabled: bool) -> PyRefMut<Self> {
+        if enabled {
+            slf.cme_databento_mbo = true;
+            slf.exch_kind = ExchangeKind::PartialFillExchange {};
+            slf.cme_mbo_order_not_found_reject_marks_inactive = true;
+        }
+        slf
+    }
+
     /// Sets the initial capacity of the vector storing the last market trades.
     /// The default value is `0`, indicating that no last trades are stored.
     pub fn last_trades_capacity(mut slf: PyRefMut<Self>, capacity: usize) -> PyRefMut<Self> {
@@ -511,116 +563,573 @@ type PowerProbQueueModelFunc = PowerProbQueueFunc;
 type PowerProbQueueModel2Func = PowerProbQueueFunc2;
 type PowerProbQueueModel3Func = PowerProbQueueFunc3;
 
-#[pyfunction]
-pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<usize> {
-    let mut local = Vec::new();
-    let mut exch = Vec::new();
-    let mut readers = Vec::new();
-    for asset in assets {
-        if let (QueueModel::L3FIFOQueueModel {}, ExchangeKind::PartialFillExchange {}) =
-            (&asset.queue_model, &asset.exch_kind)
-        {
-            return PyResult::Err(PyErr::new::<PyValueError, _>(
-                "L3PartialFillExchange is unsupported.",
-            ));
-        }
+fn build_error_to_py(err: BuildError) -> PyErr {
+    PyErr::new::<PyValueError, _>(err.to_string())
+}
 
-        let asst = build_asset!(
-            asset,
-            HashMapMarketDepth,
-            [
-                LinearAsset { contract_size },
-                InverseAsset { contract_size }
-            ],
-            [
-                ConstantLatency {
+fn backtest_error_to_py<E: std::fmt::Debug>(err: E) -> PyErr {
+    PyErr::new::<PyValueError, _>(format!("{err:?}"))
+}
+
+fn load_initial_snapshot(snapshot: &Option<DataSource<Event>>) -> PyResult<Option<Data<Event>>> {
+    match snapshot {
+        None => Ok(None),
+        Some(DataSource::Data(data)) => Ok(Some(data.clone())),
+        Some(DataSource::File(path)) => read_npz_file(path, "data").map(Some).map_err(|err| {
+            PyErr::new::<PyValueError, _>(format!("failed to read snapshot `{path}`: {err:?}"))
+        }),
+    }
+}
+
+macro_rules! l3_asset_builder_finish {
+    ($builder:expr, $asset:ident, $depth_builder:ident, $exch_kind:ident) => {{
+        $builder
+            .data($asset.data.clone())
+            .parallel_load($asset.parallel_load)
+            .latency_offset($asset.latency_offset)
+            .order_bus_max_timestamp_reordering($asset.order_bus_max_timestamp_reordering)
+            .depth($depth_builder)
+            .exchange($exch_kind)
+            .last_trades_capacity($asset.last_trades_cap)
+            .cme_mbo_order_not_found_reject_marks_inactive(
+                $asset.cme_mbo_order_not_found_reject_marks_inactive,
+            )
+            .cme_databento_mbo($asset.cme_databento_mbo)
+            .build()
+            .map_err(build_error_to_py)
+    }};
+}
+
+macro_rules! build_l3_asset_for_depth {
+    ($asset:ident, $depth_ty:ty, $depth_builder:ident, $exch_kind:ident) => {{
+        match (
+            &$asset.asset_type,
+            &$asset.latency_model,
+            &$asset.fee_model,
+            &$asset.queue_model,
+        ) {
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::ConstantLatency {
                     entry_latency,
-                    resp_latency
+                    resp_latency,
                 },
-                IntpOrderLatency {
+                FeeModel::TradingValueFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    LinearAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    TradingValueFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(LinearAsset::new(*contract_size))
+                .fee_model(TradingValueFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::ConstantLatency {
+                    entry_latency,
+                    resp_latency,
+                },
+                FeeModel::TradingQtyFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    LinearAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    TradingQtyFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(LinearAsset::new(*contract_size))
+                .fee_model(TradingQtyFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::ConstantLatency {
+                    entry_latency,
+                    resp_latency,
+                },
+                FeeModel::FlatPerTradeFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    LinearAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    FlatPerTradeFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(LinearAsset::new(*contract_size))
+                .fee_model(FlatPerTradeFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::ConstantLatency {
+                    entry_latency,
+                    resp_latency,
+                },
+                FeeModel::TradingValueFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    InverseAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    TradingValueFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(InverseAsset::new(*contract_size))
+                .fee_model(TradingValueFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::ConstantLatency {
+                    entry_latency,
+                    resp_latency,
+                },
+                FeeModel::TradingQtyFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    InverseAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    TradingQtyFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(InverseAsset::new(*contract_size))
+                .fee_model(TradingQtyFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::ConstantLatency {
+                    entry_latency,
+                    resp_latency,
+                },
+                FeeModel::FlatPerTradeFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => l3_asset_builder_finish!(
+                L3AssetBuilder::<
+                    ConstantLatency,
+                    InverseAsset,
+                    L3FIFOQueueModel,
+                    $depth_ty,
+                    FlatPerTradeFeeModel<CommonFees>,
+                >::new()
+                .latency_model(ConstantLatency::new(*entry_latency, *resp_latency))
+                .asset_type(InverseAsset::new(*contract_size))
+                .fee_model(FlatPerTradeFeeModel::new(fees.clone()))
+                .queue_model(L3FIFOQueueModel::new()),
+                $asset,
+                $depth_builder,
+                $exch_kind
+            ),
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
                     data,
-                    latency_offset
-                }
-            ],
-            [
-                RiskAdverseQueueModel {},
-                LogProbQueueModel {},
-                LogProbQueueModel2 {},
-                PowerProbQueueModel { n },
-                PowerProbQueueModel2 { n },
-                PowerProbQueueModel3 { n },
-                L3FIFOQueueModel {}
-            ],
-            [NoPartialFillExchange {}, PartialFillExchange {}],
-            [
-                TradingValueFeeModel { fees },
-                TradingQtyFeeModel { fees },
-                FlatPerTradeFeeModel { fees },
-            ]
-        );
-        local.push(asst.local);
-        exch.push(asst.exch);
-        readers.push(asst.reader);
+                    latency_offset,
+                },
+                FeeModel::TradingValueFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        LinearAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        TradingValueFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(LinearAsset::new(*contract_size))
+                    .fee_model(TradingValueFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
+                    data,
+                    latency_offset,
+                },
+                FeeModel::TradingQtyFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        LinearAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        TradingQtyFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(LinearAsset::new(*contract_size))
+                    .fee_model(TradingQtyFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            (
+                AssetType::LinearAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
+                    data,
+                    latency_offset,
+                },
+                FeeModel::FlatPerTradeFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        LinearAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        FlatPerTradeFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(LinearAsset::new(*contract_size))
+                    .fee_model(FlatPerTradeFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
+                    data,
+                    latency_offset,
+                },
+                FeeModel::TradingValueFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        InverseAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        TradingValueFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(InverseAsset::new(*contract_size))
+                    .fee_model(TradingValueFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
+                    data,
+                    latency_offset,
+                },
+                FeeModel::TradingQtyFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        InverseAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        TradingQtyFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(InverseAsset::new(*contract_size))
+                    .fee_model(TradingQtyFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            (
+                AssetType::InverseAsset { contract_size },
+                LatencyModel::IntpOrderLatency {
+                    data,
+                    latency_offset,
+                },
+                FeeModel::FlatPerTradeFeeModel { fees },
+                QueueModel::L3FIFOQueueModel {},
+            ) => {
+                let latency_model = IntpOrderLatency::build(
+                    data.clone(),
+                    $asset.parallel_load,
+                    *latency_offset,
+                )
+                .map_err(backtest_error_to_py)?;
+                l3_asset_builder_finish!(
+                    L3AssetBuilder::<
+                        IntpOrderLatency,
+                        InverseAsset,
+                        L3FIFOQueueModel,
+                        $depth_ty,
+                        FlatPerTradeFeeModel<CommonFees>,
+                    >::new()
+                    .latency_model(latency_model)
+                    .asset_type(InverseAsset::new(*contract_size))
+                    .fee_model(FlatPerTradeFeeModel::new(fees.clone()))
+                    .queue_model(L3FIFOQueueModel::new()),
+                    $asset,
+                    $depth_builder,
+                    $exch_kind
+                )
+            }
+            _ => Err(PyErr::new::<PyValueError, _>(
+                "invalid L3 asset configuration",
+            )),
+        }
+    }};
+}
+
+#[pyfunction]
+#[pyo3(signature=(assets, exch_order_equal_ts_policy_kind=0, exch_order_equal_ts_seed=0))]
+pub fn build_hashmap_backtest(
+    assets: Vec<PyRefMut<BacktestAsset>>,
+    exch_order_equal_ts_policy_kind: u8,
+    exch_order_equal_ts_seed: u64,
+) -> PyResult<usize> {
+    fn build_l3_asset(
+        asset: &BacktestAsset,
+    ) -> PyResult<Asset<dyn LocalProcessor<HashMapMarketDepth>, dyn Processor, Event>> {
+        let tick_size = asset.tick_size;
+        let lot_size = asset.lot_size;
+        let snapshot = load_initial_snapshot(&asset.initial_snapshot)?;
+        let depth_builder = move || {
+            let mut depth = HashMapMarketDepth::new(tick_size, lot_size);
+            if let Some(snapshot) = snapshot.as_ref() {
+                depth.apply_snapshot(snapshot);
+            }
+            depth
+        };
+
+        let exch_kind = match asset.exch_kind {
+            ExchangeKind::NoPartialFillExchange {} => CoreExchangeKind::NoPartialFillExchange,
+            ExchangeKind::PartialFillExchange {} => CoreExchangeKind::PartialFillExchange,
+        };
+
+        build_l3_asset_for_depth!(asset, HashMapMarketDepth, depth_builder, exch_kind)
     }
 
-    let hbt = Backtest::new(local, exch, readers);
+    let policy = match exch_order_equal_ts_policy_kind {
+        0 => ExchOrderEqualTsPolicy::BeforeExchData,
+        1 => ExchOrderEqualTsPolicy::AfterExchData,
+        2 => ExchOrderEqualTsPolicy::RandomSeeded {
+            seed: exch_order_equal_ts_seed,
+        },
+        _ => {
+            return PyResult::Err(PyErr::new::<PyValueError, _>(
+                "invalid exch_order_equal_ts_policy_kind",
+            ));
+        }
+    };
+
+    let mut builder = Backtest::<HashMapMarketDepth>::builder().exch_order_equal_ts_policy(policy);
+    for asset in assets {
+        let asst = match &asset.queue_model {
+            QueueModel::L3FIFOQueueModel {} => build_l3_asset(&asset)?,
+            // TODO(D1): Migrate L2 asset construction off `build_asset!` and onto the engine's
+            // `L2AssetBuilder` for a single-source-of-truth wiring path (and to reduce macro drift).
+            _ => build_asset!(
+                asset,
+                HashMapMarketDepth,
+                [
+                    LinearAsset { contract_size },
+                    InverseAsset { contract_size }
+                ],
+                [
+                    ConstantLatency {
+                        entry_latency,
+                        resp_latency
+                    },
+                    IntpOrderLatency {
+                        data,
+                        latency_offset
+                    }
+                ],
+                [
+                    RiskAdverseQueueModel {},
+                    LogProbQueueModel {},
+                    LogProbQueueModel2 {},
+                    PowerProbQueueModel { n },
+                    PowerProbQueueModel2 { n },
+                    PowerProbQueueModel3 { n },
+                    L3FIFOQueueModel {}
+                ],
+                [NoPartialFillExchange {}, PartialFillExchange {}],
+                [
+                    TradingValueFeeModel { fees },
+                    TradingQtyFeeModel { fees },
+                    FlatPerTradeFeeModel { fees },
+                ]
+            ),
+        };
+        builder = builder.add_asset(asst);
+    }
+
+    let hbt = builder.build().map_err(build_error_to_py)?;
     Ok(Box::into_raw(Box::new(hbt)) as *mut c_void as usize)
 }
 
 #[pyfunction]
-pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<usize> {
-    let mut local = Vec::new();
-    let mut exch = Vec::new();
-    let mut readers = Vec::new();
+#[pyo3(signature=(assets, exch_order_equal_ts_policy_kind=0, exch_order_equal_ts_seed=0))]
+pub fn build_roivec_backtest(
+    assets: Vec<PyRefMut<BacktestAsset>>,
+    exch_order_equal_ts_policy_kind: u8,
+    exch_order_equal_ts_seed: u64,
+) -> PyResult<usize> {
+    fn build_l3_asset(
+        asset: &BacktestAsset,
+    ) -> PyResult<Asset<dyn LocalProcessor<ROIVectorMarketDepth>, dyn Processor, Event>> {
+        let tick_size = asset.tick_size;
+        let lot_size = asset.lot_size;
+        let roi_lb = asset.roi_lb;
+        let roi_ub = asset.roi_ub;
+        let snapshot = load_initial_snapshot(&asset.initial_snapshot)?;
+        let depth_builder = move || {
+            let mut depth = ROIVectorMarketDepth::new(tick_size, lot_size, roi_lb, roi_ub);
+            if let Some(snapshot) = snapshot.as_ref() {
+                depth.apply_snapshot(snapshot);
+            }
+            depth
+        };
 
-    for asset in assets {
-        if let (QueueModel::L3FIFOQueueModel {}, ExchangeKind::PartialFillExchange {}) =
-            (&asset.queue_model, &asset.exch_kind)
-        {
-            return PyResult::Err(PyErr::new::<PyValueError, _>(
-                "L3PartialFillExchange is unsupported.",
-            ));
-        }
+        let exch_kind = match asset.exch_kind {
+            ExchangeKind::NoPartialFillExchange {} => CoreExchangeKind::NoPartialFillExchange,
+            ExchangeKind::PartialFillExchange {} => CoreExchangeKind::PartialFillExchange,
+        };
 
-        let asst = build_asset!(
-            asset,
-            ROIVectorMarketDepth,
-            [
-                LinearAsset { contract_size },
-                InverseAsset { contract_size }
-            ],
-            [
-                ConstantLatency {
-                    entry_latency,
-                    resp_latency
-                },
-                IntpOrderLatency {
-                    data,
-                    latency_offset
-                }
-            ],
-            [
-                RiskAdverseQueueModel {},
-                LogProbQueueModel {},
-                LogProbQueueModel2 {},
-                PowerProbQueueModel { n },
-                PowerProbQueueModel2 { n },
-                PowerProbQueueModel3 { n },
-                L3FIFOQueueModel {}
-            ],
-            [NoPartialFillExchange {}, PartialFillExchange {}],
-            [
-                TradingValueFeeModel { fees },
-                TradingQtyFeeModel { fees },
-                FlatPerTradeFeeModel { fees },
-            ]
-        );
-        local.push(asst.local);
-        exch.push(asst.exch);
-        readers.push(asst.reader);
+        build_l3_asset_for_depth!(asset, ROIVectorMarketDepth, depth_builder, exch_kind)
     }
 
-    let hbt = Backtest::new(local, exch, readers);
+    let policy = match exch_order_equal_ts_policy_kind {
+        0 => ExchOrderEqualTsPolicy::BeforeExchData,
+        1 => ExchOrderEqualTsPolicy::AfterExchData,
+        2 => ExchOrderEqualTsPolicy::RandomSeeded {
+            seed: exch_order_equal_ts_seed,
+        },
+        _ => {
+            return PyResult::Err(PyErr::new::<PyValueError, _>(
+                "invalid exch_order_equal_ts_policy_kind",
+            ));
+        }
+    };
+
+    let mut builder =
+        Backtest::<ROIVectorMarketDepth>::builder().exch_order_equal_ts_policy(policy);
+
+    for asset in assets {
+        let asst = match &asset.queue_model {
+            QueueModel::L3FIFOQueueModel {} => build_l3_asset(&asset)?,
+            // TODO(D1): Migrate L2 asset construction off `build_asset!` and onto the engine's
+            // `L2AssetBuilder` for a single-source-of-truth wiring path (and to reduce macro drift).
+            _ => build_asset!(
+                asset,
+                ROIVectorMarketDepth,
+                [
+                    LinearAsset { contract_size },
+                    InverseAsset { contract_size }
+                ],
+                [
+                    ConstantLatency {
+                        entry_latency,
+                        resp_latency
+                    },
+                    IntpOrderLatency {
+                        data,
+                        latency_offset
+                    }
+                ],
+                [
+                    RiskAdverseQueueModel {},
+                    LogProbQueueModel {},
+                    LogProbQueueModel2 {},
+                    PowerProbQueueModel { n },
+                    PowerProbQueueModel2 { n },
+                    PowerProbQueueModel3 { n },
+                    L3FIFOQueueModel {}
+                ],
+                [NoPartialFillExchange {}, PartialFillExchange {}],
+                [
+                    TradingValueFeeModel { fees },
+                    TradingQtyFeeModel { fees },
+                    FlatPerTradeFeeModel { fees },
+                ]
+            ),
+        };
+        builder = builder.add_asset(asst);
+    }
+
+    let hbt = builder.build().map_err(build_error_to_py)?;
     Ok(Box::into_raw(Box::new(hbt)) as *mut c_void as usize)
 }
 

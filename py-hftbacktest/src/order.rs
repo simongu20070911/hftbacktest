@@ -6,7 +6,10 @@ use std::{
     ptr::null,
 };
 
-use hftbacktest::prelude::Order;
+use hftbacktest::{
+    backtest::proc::{TriggerOrderKind, TriggerOrderParams},
+    prelude::Order,
+};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn orders_get(ptr: *const HashMap<u64, Order>, order_id: u64) -> *const Order {
@@ -47,4 +50,26 @@ pub extern "C" fn orders_values_next(ptr: *mut Values<u64, Order>) -> *const Ord
         },
         Some(order) => order as *const _,
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn order_trigger_params(
+    order_ptr: *const Order,
+    out_kind_u8: *mut u8,
+    out_trigger_tick_i64: *mut i64,
+) -> bool {
+    let order = unsafe { &*order_ptr };
+    let Some(params) = order.q.as_any().downcast_ref::<TriggerOrderParams>() else {
+        return false;
+    };
+
+    unsafe {
+        *out_kind_u8 = match params.kind {
+            TriggerOrderKind::StopMarket => 0,
+            TriggerOrderKind::StopLimit => 1,
+            TriggerOrderKind::Mit => 2,
+        };
+        *out_trigger_tick_i64 = params.trigger_tick;
+    }
+    true
 }

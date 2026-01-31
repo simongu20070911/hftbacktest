@@ -148,3 +148,56 @@ def validate_event_order(data: EVENT_ARRAY) -> None:
         raise ValueError('exchange events are out of order.')
     if np.sum(np.diff(data['local_ts'][local_ev]) < 0) > 0:
         raise ValueError('local events are out of order.')
+
+
+def validate_seq_monotonic(
+        data: EVENT_ARRAY,
+        *,
+        warn_equal_seq_frac: float = 0.05,
+) -> None:
+    """
+    Validates Databento-style sequence monotonicity for CME MBO:
+    within each exchange timestamp group, the sequence key (`Event.ival`) should be non-decreasing.
+
+    This is useful when running with seq tie-break enabled, where `(timestamp, seq)` ordering is
+    assumed to reflect vendor batching semantics.
+
+    Args:
+        data: Event array.
+        warn_equal_seq_frac: If more than this fraction of same-`exch_ts` adjacencies have equal
+            sequence, emit a warning (some ties are expected; many ties may indicate loss of the
+            intended tie-break key).
+    """
+    exch_ev = data['ev'] & EXCH_EVENT == EXCH_EVENT
+    exch_ts = data['exch_ts'][exch_ev]
+    seq = data['ival'][exch_ev]
+    if len(exch_ts) == 0:
+        return
+
+    bad = 0
+    equal = 0
+    prev_ts = exch_ts[0]
+    prev_seq = seq[0]
+    for i in range(1, len(exch_ts)):
+        ts = exch_ts[i]
+        s = seq[i]
+        if ts == prev_ts:
+            if s < prev_seq:
+                bad += 1
+            elif s == prev_seq:
+                equal += 1
+        prev_ts = ts
+        prev_seq = s
+
+    if bad > 0:
+        raise ValueError(f'seq is not non-decreasing within exch_ts groups: {bad} violations')
+
+    adj_same_ts = int(np.sum(exch_ts[1:] == exch_ts[:-1]))
+    if adj_same_ts > 0:
+        equal_frac = equal / adj_same_ts
+        if equal_frac > warn_equal_seq_frac:
+            import warnings
+            warnings.warn(
+                f'many equal seq keys within exch_ts groups ({equal_frac:.2%} of adjacencies); '
+                f'seq tie-break may be less informative than expected'
+            )

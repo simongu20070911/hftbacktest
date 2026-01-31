@@ -1,9 +1,19 @@
+from ctypes import (
+    CDLL,
+    POINTER,
+    c_bool,
+    c_int64,
+    c_uint8,
+    c_void_p,
+)
 from typing import Any
 
 import numpy as np
 from numba import float64, int64, uint8, from_dtype, uint64
 from numba.experimental import jitclass
 
+from . import _hftbacktest
+from .intrinsic import ptr_from_val, val_from_ptr
 from .types import order_dtype
 
 UNSUPPORTED = 255
@@ -58,6 +68,15 @@ LIMIT = 0
 
 #: MARKET
 MARKET = 1
+
+STOP_MARKET = 0
+STOP_LIMIT = 1
+MIT = 2
+
+lib = CDLL(_hftbacktest.__file__)
+order_trigger_params = lib.order_trigger_params
+order_trigger_params.restype = c_bool
+order_trigger_params.argtypes = [c_void_p, POINTER(c_uint8), POINTER(c_int64)]
 
 
 class Order:
@@ -117,7 +136,7 @@ class Order:
         """
         Returns the tick size.
         """
-        return self.arr[0].price_tick
+        return self.arr[0].tick_size
 
     @property
     def exch_timestamp(self) -> int64:
@@ -214,6 +233,36 @@ class Order:
             * :const:`IOC`
         """
         return self.arr[0].time_in_force
+
+    @property
+    def is_trigger(self) -> bool:
+        kind = uint8(0)
+        trigger_tick = int64(0)
+        kind_ptr = ptr_from_val(kind)
+        trigger_tick_ptr = ptr_from_val(trigger_tick)
+        return order_trigger_params(self.arr.ctypes.data, kind_ptr, trigger_tick_ptr)
+
+    @property
+    def trigger_kind(self) -> uint8:
+        kind = uint8(0)
+        trigger_tick = int64(0)
+        kind_ptr = ptr_from_val(kind)
+        trigger_tick_ptr = ptr_from_val(trigger_tick)
+        ok = order_trigger_params(self.arr.ctypes.data, kind_ptr, trigger_tick_ptr)
+        if not ok:
+            return UNSUPPORTED
+        return val_from_ptr(kind_ptr)
+
+    @property
+    def trigger_price(self) -> float64:
+        kind = uint8(0)
+        trigger_tick = int64(0)
+        kind_ptr = ptr_from_val(kind)
+        trigger_tick_ptr = ptr_from_val(trigger_tick)
+        ok = order_trigger_params(self.arr.ctypes.data, kind_ptr, trigger_tick_ptr)
+        if not ok:
+            return np.nan
+        return val_from_ptr(trigger_tick_ptr) * self.arr[0].tick_size
 
 
 Order_ = jitclass(Order)

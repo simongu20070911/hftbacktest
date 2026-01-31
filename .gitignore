@@ -13,3 +13,8 @@ docs/_build
 .ph_target/
 .ph_artifacts/
 hftbacktest/src.zip
+.vscode/
+.github/
+.git/
+.cargo/
+

@@ -1,21 +1,20 @@
-from typing import List, Any
+from typing import List
 
-import numpy as np
-from numpy.typing import NDArray
-
-from ._hftbacktest import (
-    BacktestAsset as BacktestAsset_,
-    build_hashmap_backtest,
-    build_roivec_backtest,
-    LiveInstrument
-)
+from ._hftbacktest import LiveInstrument, build_hashmap_backtest, build_roivec_backtest
 from .binding import (
     HashMapMarketDepthBacktest_,
     HashMapMarketDepthBacktest as HashMapMarketDepthBacktest_TypeHint,
     ROIVectorMarketDepthBacktest_,
     ROIVectorMarketDepthBacktest as ROIVectorMarketDepthBacktest_TypeHint,
-
-    event_dtype
+)
+from .builder import (
+    BacktestAsset,
+    BacktestBuilder,
+    EXCH_EQUAL_TS_AFTER_DATA,
+    EXCH_EQUAL_TS_BEFORE_DATA,
+    EXCH_EQUAL_TS_RANDOM_SEEDED,
+    L2Asset,
+    L3Asset,
 )
 from .order import (
     BUY,
@@ -27,8 +26,13 @@ from .order import (
     CANCELED,
     GTC,
     GTX,
+    FOK,
+    IOC,
     LIMIT,
     MARKET,
+    STOP_MARKET,
+    STOP_LIMIT,
+    MIT,
 )
 from .recorder import Recorder
 from .types import (
@@ -65,6 +69,12 @@ except:
 
 __all__ = (
     'BacktestAsset',
+    'L2Asset',
+    'L3Asset',
+    'BacktestBuilder',
+    'EXCH_EQUAL_TS_BEFORE_DATA',
+    'EXCH_EQUAL_TS_AFTER_DATA',
+    'EXCH_EQUAL_TS_RANDOM_SEEDED',
     'HashMapMarketDepthBacktest',
     'ROIVectorMarketDepthBacktest',
 
@@ -105,85 +115,20 @@ __all__ = (
     # Time-In-Force
     'GTC',
     'GTX',
+    'FOK',
+    'IOC',
 
     'LIMIT',
     'MARKET',
+
+    'STOP_MARKET',
+    'STOP_LIMIT',
+    'MIT',
     
     'Recorder'
 )
 
 __version__ = '2.4.4'
-
-
-class BacktestAsset(BacktestAsset_):
-    def add_data(self, data: EVENT_ARRAY):
-        self._add_data_ndarray(data.ctypes.data, len(data))
-        return self
-
-    def data(self, data: str | List[str] | EVENT_ARRAY | List[EVENT_ARRAY]):
-        """
-        Sets the feed data.
-
-        Args:
-            data: A list of file paths for the feed data in `.npz` format, or a list of NumPy arrays containing the feed
-                  data.
-        """
-        if isinstance(data, str):
-            self.add_file(data)
-        elif isinstance(data, np.ndarray):
-            self.add_data(data)
-        elif isinstance(data, list):
-            for item in data:
-                if isinstance(item, str):
-                    self.add_file(item)
-                elif isinstance(item, np.ndarray):
-                    self.add_data(item)
-                else:
-                    raise ValueError
-        else:
-            raise ValueError
-        return self
-
-    def intp_order_latency(self, data: str | NDArray | List[str], latency_offset: int = 0):
-        """
-        Uses `IntpOrderLatency <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.IntpOrderLatency.html>`_
-        for the order latency model.
-        Please see the data format.
-        The units of the historical latencies should match the timestamp units of your data.
-        Nanoseconds are typically used in HftBacktest.
-
-        Args:
-            data: A list of file paths for the historical order latency data in `npz`, or a NumPy array of the
-                  historical order latency data.
-            latency_offset: the latency offset to adjust the order entry and response latency by the
-                            specified amount. This is particularly useful in cross-exchange
-                            backtesting, where the feed data is collected from a different site than
-                            the one where the strategy is intended to run.
-        """
-        if isinstance(data, str):
-            super().intp_order_latency([data], latency_offset)
-        elif isinstance(data, np.ndarray):
-            self._intp_order_latency_ndarray(data.ctypes.data, len(data), latency_offset)
-        elif isinstance(data, list):
-            super().intp_order_latency(data, latency_offset)
-        else:
-            raise ValueError
-        return self
-
-    def initial_snapshot(self, data: str | np.ndarray[Any, event_dtype]):
-        """
-        Sets the initial snapshot.
-
-        Args:
-            data: The initial snapshot file path, or a NumPy array of the initial snapshot.
-        """
-        if isinstance(data, str):
-            super().initial_snapshot(data)
-        elif isinstance(data, np.ndarray):
-            self._initial_snapshot_ndarray(data.ctypes.data, len(data))
-        else:
-            raise ValueError
-        return self
 
 
 def HashMapMarketDepthBacktest(

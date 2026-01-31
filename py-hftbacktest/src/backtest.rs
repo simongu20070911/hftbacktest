@@ -6,7 +6,7 @@ use hftbacktest::{
     backtest::{Backtest, BacktestError},
     depth::{HashMapMarketDepth, ROIVectorMarketDepth},
     prelude::{Bot, ElapseResult, Event, Order, StateValues},
-    types::{OrdType, TimeInForce},
+    types::{OrdType, Side, TimeInForce},
 };
 
 type HashMapMarketDepthBacktest = Backtest<HashMapMarketDepth>;
@@ -35,6 +35,12 @@ fn handle_result(result: Result<ElapseResult, BacktestError>) -> i64 {
 pub extern "C" fn hashmapbt_current_timestamp(hbt_ptr: *const HashMapMarketDepthBacktest) -> i64 {
     let hbt = unsafe { &*hbt_ptr };
     hbt.current_timestamp()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_uses_seq_tie_break(hbt_ptr: *const HashMapMarketDepthBacktest) -> bool {
+    let hbt = unsafe { &*hbt_ptr };
+    hbt.uses_seq_tie_break()
 }
 
 #[unsafe(no_mangle)]
@@ -174,6 +180,111 @@ pub extern "C" fn hashmapbt_submit_sell_order(
     ))
 }
 
+#[inline]
+fn side_from_i64(side: i64) -> Side {
+    match side {
+        1 => Side::Buy,
+        -1 => Side::Sell,
+        0 => Side::None,
+        _ => Side::Unsupported,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_submit_stop_market(
+    hbt_ptr: *mut HashMapMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_stop_market(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_submit_stop_limit(
+    hbt_ptr: *mut HashMapMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    limit_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_stop_limit(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        limit_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_submit_mit(
+    hbt_ptr: *mut HashMapMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_mit(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_modify_stop_limit(
+    hbt_ptr: *mut HashMapMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    trigger_price: f64,
+    limit_price: f64,
+    qty: f64,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    handle_result(hbt.modify_stop_limit(
+        asset_no,
+        order_id,
+        trigger_price,
+        limit_price,
+        qty,
+        wait,
+    ))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hashmapbt_modify(
     hbt_ptr: *mut HashMapMarketDepthBacktest,
@@ -294,6 +405,12 @@ pub extern "C" fn hashmapbt_goto_end(hbt_ptr: *mut HashMapMarketDepthBacktest) -
 pub extern "C" fn roivecbt_current_timestamp(hbt_ptr: *const ROIVectorMarketDepthBacktest) -> i64 {
     let hbt = unsafe { &*hbt_ptr };
     hbt.current_timestamp()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_uses_seq_tie_break(hbt_ptr: *const ROIVectorMarketDepthBacktest) -> bool {
+    let hbt = unsafe { &*hbt_ptr };
+    hbt.uses_seq_tie_break()
 }
 
 #[unsafe(no_mangle)]
@@ -432,6 +549,101 @@ pub extern "C" fn roivecbt_submit_sell_order(
         qty,
         unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) },
         unsafe { mem::transmute::<u8, OrdType>(order_type) },
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_submit_stop_market(
+    hbt_ptr: *mut ROIVectorMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_stop_market(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_submit_stop_limit(
+    hbt_ptr: *mut ROIVectorMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    limit_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_stop_limit(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        limit_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_submit_mit(
+    hbt_ptr: *mut ROIVectorMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    side: i64,
+    trigger_price: f64,
+    qty: f64,
+    time_in_force: u8,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
+    handle_result(hbt.submit_mit(
+        asset_no,
+        order_id,
+        side_from_i64(side),
+        trigger_price,
+        qty,
+        tif,
+        wait,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_modify_stop_limit(
+    hbt_ptr: *mut ROIVectorMarketDepthBacktest,
+    asset_no: usize,
+    order_id: u64,
+    trigger_price: f64,
+    limit_price: f64,
+    qty: f64,
+    wait: bool,
+) -> i64 {
+    let hbt = unsafe { &mut *hbt_ptr };
+    handle_result(hbt.modify_stop_limit(
+        asset_no,
+        order_id,
+        trigger_price,
+        limit_price,
+        qty,
         wait,
     ))
 }
